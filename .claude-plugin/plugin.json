@@ -1,6 +1,6 @@
 {
   "name": "agent-doc-guard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stops agents from filling AGENTS.md, CLAUDE.md and skills with dates, anecdotes and one-off special cases. Checks each edit to an instruction file and asks for a general rule instead.",
   "author": {
     "name": "dakcoe"

@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HOME = Path.home()
@@ -49,6 +50,8 @@ NOT_REFERENCE = [HOME / ".claude" / "plans"]
 # Change logs are meant to hold dates and history
 LOG_NAME = re.compile(r"^(?:CHANGELOG|CHANGES|HISTORY|RELEASE[-_]?NOTES)\b.*\.md$", re.IGNORECASE)
 MAX_DOC_CHARS = 24_000
+# added lines per judge call; a bigger rewrite is judged in several calls
+MAX_ADDED_CHARS = 5_000
 HANGUL = re.compile(r"[가-힣]")
 
 PATTERNS = [
@@ -311,11 +314,22 @@ def mark_new(after: str, lines: list[str]) -> str:
     return "\n".join(f"[NEW] {line}" if line in new else line for line in after.splitlines())
 
 
-def judge(host: str, path: Path, after: str, lines: list[str], lang: str) -> list[str] | None:
-    """Problems found by the judge model; [] if none, None if it could not be asked."""
+def chunks(lines: list[str]) -> list[list[str]]:
+    """Added lines in batches small enough for one judge call."""
+    out, size = [[]], 0
+    for line in lines:
+        if out[-1] and size + len(line) > MAX_ADDED_CHARS:
+            out.append([])
+            size = 0
+        out[-1].append(line)
+        size += len(line)
+    return out
+
+
+def judge_once(host: str, path: Path, context: str, lines: list[str], lang: str) -> list[str] | None:
     message = (
         f"[FILE] {path}\n\n[FIX LANGUAGE] {'Korean' if lang == 'ko' else 'English'}\n\n"
-        f"[FILE AFTER EDIT]\n{mark_new(after, lines)[:MAX_DOC_CHARS]}\n\n"
+        f"[FILE AFTER EDIT]\n{context}\n\n"
         "[ADDED LINES]\n" + "\n".join(lines)
     )
     env = {**os.environ, GUARD_ENV: "1"}
@@ -328,6 +342,29 @@ def judge(host: str, path: Path, after: str, lines: list[str], lang: str) -> lis
             continue
         return [f"- [{p['kind']}] {p['line'][:80]} → {p['fix']}" for p in problems]
     return None
+
+
+def judge(host: str, path: Path, after: str, lines: list[str], lang: str) -> list[str] | None:
+    """Problems found by the judge model; [] if none, None if any batch could not be judged.
+    A large rewrite is judged in batches, several at once."""
+    marked = mark_new(after, lines)
+    batches = chunks(lines)
+    if len(batches) == 1:
+        contexts = [marked[:MAX_DOC_CHARS]]
+    else:
+        # each batch sees only the part of the file around its own lines
+        rows = marked.splitlines()
+        contexts = []
+        for b in batches:
+            hits = [i for i, row in enumerate(rows) if row.startswith("[NEW] ") and row[6:] in set(b)]
+            lo, hi = (max(0, min(hits) - 40), max(hits) + 40) if hits else (0, 80)
+            contexts.append("\n".join(rows[lo:hi])[:MAX_DOC_CHARS])
+    with ThreadPoolExecutor(max_workers=min(8, len(batches))) as pool:
+        results = list(pool.map(lambda bc: judge_once(host, path, bc[1], bc[0], lang), zip(batches, contexts)))
+    problems = [p for r in results if r for p in r]
+    if problems:
+        return problems
+    return None if any(r is None for r in results) else []
 
 
 # A write inside a shell command. Heredocs and cat are left out because they are used for reading too.

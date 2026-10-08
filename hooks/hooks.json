@@ -8,7 +8,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/agent_doc_guard.py\"",
-            "timeout": 200,
+            "timeout": 300,
             "statusMessage": "Checking instruction file edit"
           }
         ]
@@ -21,7 +21,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/agent_doc_guard.py\"",
-            "timeout": 200,
+            "timeout": 300,
             "statusMessage": "Checking instruction files after command"
           }
         ]
