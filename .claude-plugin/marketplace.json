@@ -1,0 +1,14 @@
+{
+  "$schema": "https://www.schemastore.org/claude-code-marketplace.json",
+  "name": "agent-doc-guard",
+  "description": "Keeps agent instruction files short: general rules only, no history or anecdotes.",
+  "owner": { "name": "dakcoe" },
+  "plugins": [
+    {
+      "name": "agent-doc-guard",
+      "description": "Checks edits to AGENTS.md, CLAUDE.md, skills and the docs they point to, and refuses dates, anecdotes and one-off special cases.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

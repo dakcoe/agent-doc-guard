@@ -1,0 +1,16 @@
+{
+  "name": "agent-doc-guard",
+  "owner": {
+    "name": "dakcoe"
+  },
+  "plugins": [
+    {
+      "name": "agent-doc-guard",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "description": "Checks edits to AGENTS.md, skills and the docs they point to, and refuses dates, anecdotes and one-off special cases."
+    }
+  ]
+}

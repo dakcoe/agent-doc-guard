@@ -1,0 +1,24 @@
+{
+  "name": "agent-doc-guard",
+  "version": "0.1.0",
+  "description": "Stops agents from filling AGENTS.md, CLAUDE.md and skills with dates, anecdotes and one-off special cases. Checks each edit to an instruction file and asks for a general rule instead.",
+  "author": {
+    "name": "dakcoe"
+  },
+  "homepage": "https://github.com/dakcoe/agent-doc-guard",
+  "repository": "https://github.com/dakcoe/agent-doc-guard",
+  "license": "MIT",
+  "keywords": [
+    "hooks",
+    "agents-md",
+    "claude-md",
+    "skills",
+    "documentation",
+    "codex"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "agent-doc-guard"
+  },
+  "skills": "./skills/"
+}
