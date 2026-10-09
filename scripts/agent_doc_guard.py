@@ -59,7 +59,7 @@ HANGUL = re.compile(r"[가-힣]")
 
 PATTERNS = [
     # dates
-    (r"\b20\d{2}-\d{1,2}-\d{1,2}\b", "date"),
+    (r"(?<!\d)20\d{2}-\d{1,2}-\d{1,2}(?!\d)", "date"),
     (r"\d{1,2}월 ?\d{1,2}일", "date"),
     (r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.? \d{1,2}(?:st|nd|rd|th)?\b", "date"),
     # who said what

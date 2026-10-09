@@ -73,7 +73,7 @@ class GuardTest(unittest.TestCase):
 
     # patterns
     def test_korean_history_is_refused(self):
-        for line in ["10월 3일 영상에서 겹쳤다.", "전환이 밋밋하다고 지적받았다.", "넣었다가 다시 뺐다.",
+        for line in ["10월 3일 영상에서 겹쳤다.", "2026-10-05부터 테스트를 돌린다.", "전환이 밋밋하다고 지적받았다.", "넣었다가 다시 뺐다.",
                      "## 9. 네트워크 영상에서 더한 것"]:
             self.assertTrue(denied(self.edit("docs/style.md", line)), line)
 
