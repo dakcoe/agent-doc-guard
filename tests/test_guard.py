@@ -108,6 +108,32 @@ class GuardTest(unittest.TestCase):
                   "cp AGENTS.md /tmp/copy.md", "echo hi > notes.md"]:
             self.assertFalse(denied(self.bash(c)), c)
 
+    def test_bash_read_with_unrelated_write_passes(self):
+        for c in ["diff -u notes.md AGENTS.md > out.diff && rm out.diff", "diff notes.md AGENTS.md > /tmp/x.md",
+                  "grep rule AGENTS.md | tee out.txt", "sed -i '' s/a/b/ notes.md && cat AGENTS.md"]:
+            self.assertFalse(denied(self.bash(c)), c)
+
+    def test_backup_copy_of_agent_folder_is_not_an_instruction_file(self):
+        backup = self.root / "backup" / "before" / ".claude" / "context"
+        backup.mkdir(parents=True)
+        (backup / "x.md").write_text("old\n")
+        (self.root / ".claude" / "context").mkdir(parents=True)
+        (self.root / ".claude" / "context" / "x.md").write_text("rule\n")
+        for c in ["cp .claude/context/x.md backup/before/.claude/context/x.md",
+                  "diff -u backup/before/.claude/context/x.md .claude/context/x.md > /tmp/o.diff"]:
+            self.assertFalse(denied(self.bash(c)), c)
+        # the project's own .claude folder still counts
+        self.assertTrue(denied(self.bash("cp backup/before/.claude/context/x.md .claude/context/x.md")))
+        self.assertTrue(denied(self.bash("cp notes.md .claude/context/")))
+        guard = load_guard()
+        self.assertTrue(guard.is_reference(Path.home() / ".agents" / "skills" / "x" / "reference.md"))
+
+    def test_bash_paths_follow_cd(self):
+        (self.root / "sub").mkdir()
+        reason = self.bash("cd sub && echo hi >> AGENTS.md")["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn(str(Path("sub") / "AGENTS.md"), reason)
+        self.assertTrue(denied(self.bash("cd docs && sed -i.bak s/a/b/ style.md")))
+
     # Codex
     def patch(self, body: str) -> dict:
         return run({"tool_name": "apply_patch", "cwd": str(self.root),

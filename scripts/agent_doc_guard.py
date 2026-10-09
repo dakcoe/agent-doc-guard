@@ -33,6 +33,7 @@ import difflib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -184,6 +185,15 @@ def under(path: Path, root: Path) -> bool:
         return False
 
 
+def agent_folder(folder: Path) -> bool:
+    """A .claude, .agents or .codex folder at the root of a project. A copy of one elsewhere, such as
+    a backup, has no project files next to it."""
+    if folder.name not in (".claude", ".agents", ".codex"):
+        return False
+    root = folder.parent
+    return root == HOME or any((root / n).exists() for n in (".git", "AGENTS.md", "CLAUDE.md", "GEMINI.md"))
+
+
 def is_reference(path: Path) -> bool:
     """Instruction files: known names, anything under ~/.claude or ~/.codex, .claude/ or .agents/
     folders, and any .md that an AGENTS.md or CLAUDE.md in a parent folder names."""
@@ -195,7 +205,7 @@ def is_reference(path: Path) -> bool:
         return True
     if any(under(path, root) for root in AGENT_HOMES):
         return True
-    if {".claude", ".agents", ".codex"} & set(path.parts):
+    if any(agent_folder(folder) for folder in path.parents):
         return True
     for folder in path.parents:
         for name in ("AGENTS.md", "CLAUDE.md"):
@@ -445,12 +455,11 @@ def judge(host: str, path: Path, after: str, hunks: list[list[str]], lang: str) 
     return None if any(r is None for r in results) else []
 
 
-# A write inside a shell command. Heredocs and cat are left out because they are used for reading too.
-WRITE_IN_BASH = re.compile(
-    r"sed\s+-i|perl\s+-[a-z]*i|\btee\b|>\s*[^&\s|]*\.md|\.write\(|write_text|open\([^)]*['\"][wa]|\brm\b"
-)
-# cp/mv: only the last argument (the destination) is written
-COPY_OR_MOVE = re.compile(r"\b(?:cp|mv)\b[^;&|]*?\s(\S+\.md)\s*(?:[;&|]|$)")
+# A write from code run inside a shell command (python -c, node -e, an interpreter heredoc)
+WRITE_IN_CODE = re.compile(r"\.write\(|write_text|writeFileSync|appendFileSync|open\([^)]*['\"][wa]")
+REDIRECTS = {">", ">>", ">|", "&>", "&>>"}
+SEPARATORS = {";", "&&", "||", "|", "|&", "&", ";;", "(", ")"}
+PREFIXES = {"sudo", "command", "env", "builtin", "exec", "nohup", "time"}
 MD_TOKEN = re.compile(r"[~\w./가-힣()-]*\.md\b")
 # Heredoc bodies fed to a command (a commit message, a here-string) are input text, not paths, and
 # are skipped. Bodies fed to an interpreter (python3 - <<EOF) are code and stay in the check.
@@ -467,13 +476,75 @@ def strip_heredocs(command: str) -> str:
     return HEREDOC.sub(body, command)
 
 
+def simple_commands(command: str, cwd: str) -> list[tuple[list[str], str, str]]:
+    """The simple commands in a shell command, as (words, folder they run in, source line). A `cd`
+    changes the folder for the commands after it."""
+    out = []
+    for line in strip_heredocs(command).splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        try:
+            tokens = list(lexer)
+        except ValueError:
+            tokens = line.split()
+        words: list[str] = []
+        for t in tokens + [";"]:
+            if t not in SEPARATORS:
+                words.append(t)
+                continue
+            while words and (words[0] in PREFIXES or re.match(r"^\w+=", words[0])):
+                words.pop(0)
+            if words and words[0] == "cd":
+                arg = words[1] if len(words) > 1 else "~"
+                if arg != "-":
+                    cwd = str(resolve(arg, cwd))
+            elif words:
+                out.append((words, cwd, line))
+            words = []
+    return out
+
+
+def write_targets(words: list[str], cwd: str, line: str) -> list[Path]:
+    """Files one simple command writes, as far as its words show: redirect targets, tee files,
+    sed -i / perl -i files, rm arguments, the cp/mv destination, and .md paths in code that writes."""
+    targets, args = [], []
+    skip = False
+    for i, w in enumerate(words):
+        if skip:
+            skip = False
+        elif w in REDIRECTS:
+            if i + 1 < len(words):
+                targets.append(words[i + 1])
+            skip = True
+        elif w in ("<", ">&", "<&", "<<", "<<<", "<<-"):
+            skip = True
+        else:
+            args.append(w)
+    if WRITE_IN_CODE.search(line):
+        # code is not shell words; take the .md paths from the line as written
+        targets += MD_TOKEN.findall(line)
+    if not args:
+        return [resolve(t, cwd) for t in targets]
+    name = os.path.basename(args[0])
+    files = [a for a in args[1:] if not a.startswith("-")]
+    if name == "tee":
+        targets += files
+    elif name in ("sed", "gsed", "perl") and any(re.match(r"^-[A-Za-z]*i|^--in-place", a) for a in args[1:]):
+        targets += [a for a in files if a.endswith(".md")]
+    elif name == "rm":
+        targets += files
+    elif name in ("cp", "mv", "install") and len(files) >= 2:
+        dest = resolve(files[-1], cwd)
+        if dest.is_dir():
+            return [resolve(t, cwd) for t in targets] + [dest / Path(f).name for f in files[:-1]]
+        targets.append(files[-1])
+    return [resolve(t, cwd) for t in targets]
+
+
 def check_bash(host: str, command: str, cwd: str) -> None:
     """Quick refusal for commands that visibly write to an instruction file. Anything it misses is
     caught after the command runs, by comparing the files (see check_bash_result)."""
-    command = strip_heredocs(command)
-    targets = [resolve(m.group(1), cwd) for m in COPY_OR_MOVE.finditer(command)]
-    if WRITE_IN_BASH.search(command):
-        targets += [resolve(t, cwd) for t in MD_TOKEN.findall(command)]
+    targets = [p for words, folder, line in simple_commands(command, cwd) for p in write_targets(words, folder, line)]
     for p in targets:
         if is_reference(p):
             emit_deny(MESSAGES[language(read(p) + command)]["bash"].format(path=p, tool=EDIT_TOOL[host]))
@@ -541,12 +612,14 @@ def named_docs(guide: Path) -> list[Path]:
 
 def watched_files(cwd: str, command: str) -> set[Path]:
     """Instruction files a shell command in `cwd` could plausibly change."""
-    start = Path(cwd).resolve()
-    guides = list(guides_below(start))
-    for folder in [start, *start.parents]:
-        guides += [folder / n for n in ("AGENTS.md", "CLAUDE.md", "GEMINI.md") if (folder / n).is_file()]
-        if folder == HOME:
-            break
+    commands = simple_commands(command, cwd)
+    guides = []
+    for start in {Path(cwd).resolve(), *(Path(folder) for _, folder, _ in commands)}:
+        guides += guides_below(start)
+        for folder in [start, *start.parents]:
+            guides += [folder / n for n in ("AGENTS.md", "CLAUDE.md", "GEMINI.md") if (folder / n).is_file()]
+            if folder == HOME:
+                break
     for home in AGENT_HOMES:
         guides += [p for p in (home / "CLAUDE.md", home / "AGENTS.md") if p.is_file()]
         for sub in ("context", "skills", "rules", "agents", "commands"):
@@ -557,7 +630,7 @@ def watched_files(cwd: str, command: str) -> set[Path]:
     for g in guides:
         files.add(g.resolve())
         files.update(named_docs(g))
-    files.update(resolve(t, cwd) for t in MD_TOKEN.findall(command))
+    files.update(resolve(t, folder) for _, folder, line in commands for t in MD_TOKEN.findall(line))
     return {p for p in list(files)[: MAX_FILES * 2] if is_reference(p)}
 
 
