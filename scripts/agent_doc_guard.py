@@ -685,9 +685,13 @@ def check_bash_result(host: str, data: dict) -> None:
             continue  # unchanged, or deleted
         reason = review(host, p, old, new)
         if reason:
+            if p.is_symlink():
+                # saved paths are resolved, so a link here was made by the command; writing through
+                # it would overwrite the file it points to
+                p.unlink()
             if name in before:
                 p.write_text(old)
-            else:
+            elif p.exists():
                 p.unlink()
             reasons.append(reason)
     if reasons:

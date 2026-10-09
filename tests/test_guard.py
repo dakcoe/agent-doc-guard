@@ -172,6 +172,15 @@ class GuardTest(unittest.TestCase):
             self.assertEqual(result.get("decision"), "block", command)
             self.assertEqual((self.root / "AGENTS.md").read_text(), original, command)
 
+    def test_reverting_a_new_symlink_keeps_its_target(self):
+        original = (self.root / "AGENTS.md").read_text()
+        (self.root / "old.txt").write_text("Fixed on 2026-10-05.\n")
+        result = self.run_bash("ln -sf old.txt AGENTS.md")
+        self.assertEqual(result.get("decision"), "block")
+        self.assertFalse((self.root / "AGENTS.md").is_symlink())
+        self.assertEqual((self.root / "AGENTS.md").read_text(), original)
+        self.assertEqual((self.root / "old.txt").read_text(), "Fixed on 2026-10-05.\n")
+
     def test_shell_write_into_linked_doc_is_reverted(self):
         original = (self.root / "docs" / "style.md").read_text()
         result = self.run_bash("cd docs && printf '%s\\n' '- 10월 3일에 겹쳤다.' | tee -a style.md >/dev/null")
