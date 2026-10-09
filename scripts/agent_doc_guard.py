@@ -8,8 +8,10 @@ for that one situation. Those lines stay in every future prompt and narrow the n
 judgement. This hook checks the lines an edit adds to such a file and refuses the edit when
 they carry that kind of content, telling the agent which lines to rewrite as general rules.
 
-File edits (Claude Code: Edit/Write/MultiEdit, Codex: apply_patch): added lines go through fixed
-  patterns first, then a small model judges the rest. Lines that are only removed are never checked.
+File edits (Claude Code: Edit/Write/MultiEdit, Codex: apply_patch): the whole file after the edit is
+  built first and compared with the file before it. Added and changed lines go through fixed patterns,
+  then a small model judges them from the diff. Lines that are only removed are never checked, and lines
+  the edit leaves alone are left to the doc-cleanup skill.
 Bash: a command that visibly writes to an instruction file is refused before it runs. Whatever it
   misses is caught afterwards: instruction files are saved before the command and compared after it;
   a change that fails the same review is put back and the agent is told why.
@@ -50,8 +52,8 @@ NOT_REFERENCE = [HOME / ".claude" / "plans"]
 # Change logs are meant to hold dates and history
 LOG_NAME = re.compile(r"^(?:CHANGELOG|CHANGES|HISTORY|RELEASE[-_]?NOTES)\b.*\.md$", re.IGNORECASE)
 MAX_DOC_CHARS = 24_000
-# added lines per judge call; a bigger rewrite is judged in several calls
-MAX_ADDED_CHARS = 5_000
+# diff text per judge call; a bigger rewrite is judged in several calls, split at hunk boundaries
+MAX_DIFF_CHARS = 5_000
 HANGUL = re.compile(r"[가-힣]")
 
 PATTERNS = [
@@ -79,17 +81,22 @@ Many agents re-read this file on every task. Anything unnecessary pollutes every
 anything fitted to one past event narrows the judgement of agents working on unrelated tasks.
 The file must stay short, clear and simple.
 
-Find lines in [ADDED LINES] that fall into one of these kinds:
+[DIFF] is a unified diff of the edit. Judge only the lines that start with `+`: they are added or changed by this edit.
+Lines that start with `-` are removed by this edit and are not in the file afterwards; never treat them as something a `+` line duplicates.
+Lines that start with a space are unchanged context; do not report them.
+[FILE AFTER EDIT] is the whole file once the edit is applied, without diff markers.
+
+Find `+` lines that fall into one of these kinds:
 1. provenance: dates, who pointed out what and when, which task/video/file something happened in, quotes of the user.
 2. anecdote: a description of something that actually happened ("A and B overlapped before"), including when it is attached as the reason for a rule.
 3. example: an example that records a specific case (what happened, in which task). Templates that show the form of good output are fine: a command or path format, or a pair contrasting a wording to avoid with the wording to use.
 4. narrow-condition: a special-case branch that came from one situation ("if X, do Y") where one general rule would do.
-5. duplicate: a rule that a different line of [FILE AFTER EDIT] already states. In [FILE AFTER EDIT] the added lines are marked [NEW]; a [NEW] line is not a duplicate of itself.
+5. duplicate: a rule that a different line of [FILE AFTER EDIT] already states. The `+` line itself also appears in [FILE AFTER EDIT]; that copy is not a duplicate.
 6. unnecessary: a line whose removal would not change what the agent does: background with no rule, a summary, or an instruction the agent already follows by default.
 
 Facts the agent cannot know on its own (locations, commands, paths, environment, measured numbers and limits, known causes and their fixes, how the current system differs from its stated design), general rules, and a short reason that explains why a rule exists are fine.
 If nothing is wrong, set ok to true and problems to an empty list.
-For each problem, put the first 40 characters of the line in `line` and one sentence on how to fix it in `fix`.
+For each problem, put the first 40 characters of the `+` line, without the `+`, in `line` and one sentence on how to fix it in `fix`.
 Write `fix` in the language named in [FIX LANGUAGE].
 """
 
@@ -217,61 +224,103 @@ def read(path: Path) -> str:
     return path.read_text(errors="ignore") if path.is_file() else ""
 
 
-def added_lines(old: str, new: str) -> list[str]:
-    return [line[2:] for line in difflib.ndiff(old.splitlines(), new.splitlines())
-            if line.startswith("+ ") and line[2:].strip()]
-
-
-Change = "tuple[Path, list[str], str]"  # file, lines the edit adds, file text after the edit
+Change = "tuple[Path, str, str]"  # file, text before the edit, text after the edit
 
 
 def claude_changes(tool: str, inp: dict, cwd: str) -> list[Change]:
     path = resolve(inp.get("file_path", ""), cwd)
     before = read(path)
     if tool == "Write":
-        after = inp.get("content", "")
-        return [(path, added_lines(before, after), after)]
+        return [(path, before, inp.get("content", ""))]
     edits = inp.get("edits") if tool == "MultiEdit" else [inp]
-    lines: list[str] = []
     after = before
     for e in edits or []:
         old, new = e.get("old_string", ""), e.get("new_string", "")
-        lines += added_lines(old, new)
         after = after.replace(old, new) if e.get("replace_all") else after.replace(old, new, 1)
-    return [(path, lines, after)]
+    return [(path, before, after)]
 
 
 PATCH_FILE = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$")
 
 
+def find_block(lines: list[str], block: list[str], start: int) -> int:
+    """Index where `block` occurs in `lines` at or after `start`, comparing like apply_patch does:
+    exactly, then ignoring trailing spaces, then ignoring surrounding spaces. -1 if absent."""
+    for norm in (lambda s: s, str.rstrip, str.strip):
+        want = [norm(b) for b in block]
+        for i in range(start, len(lines) - len(block) + 1):
+            if [norm(x) for x in lines[i:i + len(block)]] == want:
+                return i
+    return -1
+
+
+def apply_hunks(text: str, hunks: list[list[str]]) -> str | None:
+    """`text` with apply_patch hunks applied, or None if a hunk does not match the file."""
+    lines = text.splitlines()
+    pos = 0
+    for hunk in hunks:
+        header, body = hunk[0], hunk[1:]
+        anchor = header[2:].strip()
+        if anchor:
+            i = find_block(lines, [anchor], pos)
+            if i < 0:
+                return None
+            pos = i + 1
+        old = [l[1:] for l in body if l[:1] in (" ", "-")]
+        new = [l[1:] for l in body if l[:1] in (" ", "+")]
+        if not old:
+            # a hunk with nothing to match adds its lines at the end of the file
+            lines += new
+            pos = len(lines)
+            continue
+        i = find_block(lines, old, pos)
+        if i < 0:
+            return None
+        lines[i:i + len(old)] = new
+        pos = i + len(new)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def codex_changes(patch: str, cwd: str) -> list[Change]:
-    """Files an apply_patch touches, with the lines it adds. Deleting a file adds nothing.
-    The text after the edit is approximate: removed lines dropped, added lines appended."""
-    files: dict[Path, tuple[list[str], list[str]]] = {}
+    """Files an apply_patch adds or updates, with their text before and after the patch. Deleting a
+    file adds nothing. A hunk that does not match the file is applied approximately (its removed lines
+    dropped where found, its added lines appended); apply_patch itself would reject such a patch."""
+    files: dict[Path, tuple[Path | None, list[list[str]]]] = {}  # target: (file read for "before", hunks)
     current = None
     for line in patch.splitlines():
         m = PATCH_FILE.match(line)
         if m:
-            current = resolve(m.group(2).strip(), cwd)
-            files.setdefault(current, ([], []))
+            path = resolve(m.group(2).strip(), cwd)
+            current = None if m.group(1) == "Delete" else path
+            if current is not None:
+                files[current] = (path if m.group(1) == "Update" else None, [["@@"]])
             continue
         if line.startswith("*** Move to: ") and current is not None:
+            source, hunks = files.pop(current)
             current = resolve(line[len("*** Move to: "):].strip(), cwd)
-            files.setdefault(current, ([], []))
+            files[current] = (source, hunks)
             continue
-        if current is None or line.startswith("***") or line.startswith("@@"):
+        if current is None or line.startswith("***"):
             continue
-        if line.startswith("+"):
-            files[current][1].append(line[1:])
-        elif line.startswith("-"):
-            files[current][0].append(line[1:])
+        hunks = files[current][1]
+        if line.startswith("@@"):
+            hunks.append([line])
+        elif line[:1] in (" ", "+", "-") or line == "":
+            hunks[-1].append(line or " ")
     changes = []
-    for p, (old, new) in files.items():
-        kept = read(p).splitlines()
-        for line in old:
-            if line in kept:
-                kept.remove(line)
-        changes.append((p, added_lines("\n".join(old), "\n".join(new)), "\n".join(kept + new)))
+    for target, (source, hunks) in files.items():
+        hunks = [h for h in hunks if len(h) > 1]
+        before = read(source) if source else ""
+        after = apply_hunks(before, hunks)
+        if after is None:
+            kept = before.splitlines()
+            for h in hunks:
+                for l in h[1:]:
+                    if l.startswith("-") and l[1:] in kept:
+                        kept.remove(l[1:])
+            kept += [l[1:] for h in hunks for l in h[1:] if l.startswith("+")]
+            after = "\n".join(kept) + "\n"
+        changes.append((target, before, after))
     return changes
 
 
@@ -309,29 +358,69 @@ def ask_codex(message: str, env: dict) -> dict:
         return json.loads(answer.read_text())
 
 
-def mark_new(after: str, lines: list[str]) -> str:
-    new = set(lines)
-    return "\n".join(f"[NEW] {line}" if line in new else line for line in after.splitlines())
+def diff_hunks(before: str, after: str) -> list[list[str]]:
+    """The unified diff of an edit, as hunks of lines (each starting with its @@ header)."""
+    hunks: list[list[str]] = []
+    for line in difflib.unified_diff(before.splitlines(), after.splitlines(), n=3, lineterm=""):
+        if line.startswith("@@"):
+            hunks.append([line])
+        elif hunks:
+            hunks[-1].append(line)
+    return hunks
 
 
-def chunks(lines: list[str]) -> list[list[str]]:
-    """Added lines in batches small enough for one judge call."""
+def added_lines(hunks: list[list[str]]) -> list[str]:
+    return [l[1:] for h in hunks for l in h[1:] if l.startswith("+") and l[1:].strip()]
+
+
+def batches(hunks: list[list[str]]) -> list[list[list[str]]]:
+    """Hunks in batches small enough for one judge call. A hunk too big for one call is cut into pieces."""
+    pieces = []
+    for h in hunks:
+        piece, size = [h[0]], 0
+        for line in h[1:]:
+            if size + len(line) > MAX_DIFF_CHARS and len(piece) > 1:
+                pieces.append(piece)
+                piece, size = [h[0]], 0
+            piece.append(line)
+            size += len(line) + 1
+        pieces.append(piece)
+    # a piece that only removes lines gives the judge nothing to judge
+    pieces = [p for p in pieces if any(l.startswith("+") for l in p[1:])]
     out, size = [[]], 0
-    for line in lines:
-        if out[-1] and size + len(line) > MAX_ADDED_CHARS:
+    for piece in pieces:
+        n = sum(len(l) + 1 for l in piece)
+        if out[-1] and size + n > MAX_DIFF_CHARS:
             out.append([])
             size = 0
-        out[-1].append(line)
-        size += len(line)
+        out[-1].append(piece)
+        size += n
     return out
 
 
-def judge_once(host: str, path: Path, context: str, lines: list[str], lang: str) -> list[str] | None:
+def squash(text: str) -> str:
+    return " ".join(text.split())
+
+
+def on_added_line(problem: dict, lines: list[str]) -> bool:
+    """Whether the judge's `line` points at one of the added lines: equal after collapsing spaces,
+    or the start of one. A problem pointing elsewhere is about a line this edit did not touch."""
+    quoted = squash(problem.get("line", "")).rstrip(".…").strip()
+    if quoted.startswith("+"):
+        quoted = quoted[1:].strip()
+    if not quoted:
+        return False
+    return any(squash(l).startswith(quoted) for l in lines)
+
+
+def judge_once(host: str, path: Path, after: str, batch: list[list[str]], lang: str) -> list[str] | None:
+    diff = "\n".join(l for h in batch for l in h)
     message = (
         f"[FILE] {path}\n\n[FIX LANGUAGE] {'Korean' if lang == 'ko' else 'English'}\n\n"
-        f"[FILE AFTER EDIT]\n{context}\n\n"
-        "[ADDED LINES]\n" + "\n".join(lines)
+        f"[DIFF]\n{diff}\n\n"
+        f"[FILE AFTER EDIT]\n{after[:MAX_DOC_CHARS]}"
     )
+    lines = added_lines(batch)
     env = {**os.environ, GUARD_ENV: "1"}
     ask = ask_codex if host == "codex" else ask_claude
     for _ in range(2):
@@ -340,27 +429,16 @@ def judge_once(host: str, path: Path, context: str, lines: list[str], lang: str)
             problems = data["problems"]
         except Exception:
             continue
-        return [f"- [{p['kind']}] {p['line'][:80]} → {p['fix']}" for p in problems]
+        return [f"- [{p['kind']}] {p['line'][:80]} → {p['fix']}" for p in problems if on_added_line(p, lines)]
     return None
 
 
-def judge(host: str, path: Path, after: str, lines: list[str], lang: str) -> list[str] | None:
+def judge(host: str, path: Path, after: str, hunks: list[list[str]], lang: str) -> list[str] | None:
     """Problems found by the judge model; [] if none, None if any batch could not be judged.
     A large rewrite is judged in batches, several at once."""
-    marked = mark_new(after, lines)
-    batches = chunks(lines)
-    if len(batches) == 1:
-        contexts = [marked[:MAX_DOC_CHARS]]
-    else:
-        # each batch sees only the part of the file around its own lines
-        rows = marked.splitlines()
-        contexts = []
-        for b in batches:
-            hits = [i for i, row in enumerate(rows) if row.startswith("[NEW] ") and row[6:] in set(b)]
-            lo, hi = (max(0, min(hits) - 40), max(hits) + 40) if hits else (0, 80)
-            contexts.append("\n".join(rows[lo:hi])[:MAX_DOC_CHARS])
-    with ThreadPoolExecutor(max_workers=min(8, len(batches))) as pool:
-        results = list(pool.map(lambda bc: judge_once(host, path, bc[1], bc[0], lang), zip(batches, contexts)))
+    groups = batches(hunks)
+    with ThreadPoolExecutor(max_workers=min(8, len(groups))) as pool:
+        results = list(pool.map(lambda b: judge_once(host, path, after, b, lang), groups))
     problems = [p for r in results if r for p in r]
     if problems:
         return problems
@@ -401,9 +479,13 @@ def check_bash(host: str, command: str, cwd: str) -> None:
             emit_deny(MESSAGES[language(read(p) + command)]["bash"].format(path=p, tool=EDIT_TOOL[host]))
 
 
-def review(host: str, path: Path, lines: list[str], after: str) -> str | None:
-    """Reason to refuse an edit that adds `lines` to `path`, or None if it may stay."""
-    if not lines or not is_reference(path):
+def review(host: str, path: Path, before: str, after: str) -> str | None:
+    """Reason to refuse an edit that turns `path` from `before` into `after`, or None if it may stay."""
+    if not is_reference(path):
+        return None
+    hunks = diff_hunks(before, after)
+    lines = added_lines(hunks)
+    if not lines:
         return None
     lang = language(after + "\n".join(lines))
     msg = MESSAGES[lang]
@@ -413,7 +495,7 @@ def review(host: str, path: Path, lines: list[str], after: str) -> str | None:
         return header + "\n".join(found)
     if not JUDGE_ON:
         return None
-    problems = judge(host, path, after, lines, lang)
+    problems = judge(host, path, after, hunks, lang)
     if problems is None:
         if STRICT:
             return msg["judge_failed_strict"].format(name=path.name)
@@ -422,8 +504,8 @@ def review(host: str, path: Path, lines: list[str], after: str) -> str | None:
     return header + "\n".join(problems) if problems else None
 
 
-def check_file(host: str, path: Path, lines: list[str], after: str) -> None:
-    reason = review(host, path, lines, after)
+def check_file(host: str, path: Path, before: str, after: str) -> None:
+    reason = review(host, path, before, after)
     if reason:
         emit_deny(reason)
 
@@ -521,7 +603,7 @@ def check_bash_result(host: str, data: dict) -> None:
         new = read(p)
         if new == old or not p.exists():
             continue  # unchanged, or deleted
-        reason = review(host, p, added_lines(old, new), new)
+        reason = review(host, p, old, new)
         if reason:
             if name in before:
                 p.write_text(old)
@@ -558,11 +640,11 @@ def main() -> None:
     elif event != "PreToolUse":
         return
     elif tool == "apply_patch":
-        for path, lines, after in codex_changes(inp.get("command", ""), cwd):
-            check_file(host, path, lines, after)
+        for path, before, after in codex_changes(inp.get("command", ""), cwd):
+            check_file(host, path, before, after)
     elif tool in ("Edit", "Write", "MultiEdit"):
-        for path, lines, after in claude_changes(tool, inp, cwd):
-            check_file(host, path, lines, after)
+        for path, before, after in claude_changes(tool, inp, cwd):
+            check_file(host, path, before, after)
 
 
 if __name__ == "__main__":
