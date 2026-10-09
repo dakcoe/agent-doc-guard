@@ -254,6 +254,10 @@ class JudgeTest(unittest.TestCase):
         self.answer = {"ok": False, "problems": [
             {"line": "+-  Keep captions to three", "kind": "unnecessary", "fix": "drop it"}]}
         self.assertIn("Keep captions to three", self.review("Edit", edit))
+        # a quote without the list bullet still points at the changed line
+        self.answer = {"ok": False, "problems": [
+            {"line": "Keep captions to three lines", "kind": "unnecessary", "fix": "drop it"}]}
+        self.assertIsNotNone(self.review("Edit", edit))
 
     def test_section_removed_in_same_edit_is_only_a_minus_line(self):
         path = self.write("# Rules\n## A\n- Run the tests before every commit.\n\n## B\n- Keep captions short.\n")

@@ -408,16 +408,23 @@ def batches(hunks: list[list[str]]) -> list[list[list[str]]]:
     return out
 
 
+# list bullets, quote marks, heading marks and numbering at the start of a line
+LINE_MARKS = re.compile(r"^(?:[+\-*>#]+|\d+[.)])\s*")
+
+
 def squash(text: str) -> str:
-    return " ".join(text.split())
+    """A line with spaces collapsed and its leading diff and Markdown marks removed."""
+    text = " ".join(text.split())
+    while LINE_MARKS.match(text) and LINE_MARKS.sub("", text, 1) != text:
+        text = LINE_MARKS.sub("", text, 1)
+    return text
 
 
 def on_added_line(problem: dict, lines: list[str]) -> bool:
-    """Whether the judge's `line` points at one of the added lines: equal after collapsing spaces,
-    or the start of one. A problem pointing elsewhere is about a line this edit did not touch."""
+    """Whether the judge's `line` points at one of the added lines: equal or the start of one once
+    spaces and leading marks are normalized. A problem pointing elsewhere is about a line this edit
+    did not touch."""
     quoted = squash(problem.get("line", "")).rstrip(".…").strip()
-    if quoted.startswith("+"):
-        quoted = quoted[1:].strip()
     if not quoted:
         return False
     return any(squash(l).startswith(quoted) for l in lines)
