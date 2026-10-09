@@ -69,6 +69,7 @@ Needs `python3`. The check runs on the agent you are using: `claude -p` under Cl
 - New lines with dates, past incidents, one-off special cases or repeated rules are sent back to the agent with the reason.
 - Shell commands are covered too: those files are compared before and after each command, and a change that fails the check is put back.
 - Deleting lines is always allowed. English and Korean.
+- What you asked for goes through. The check reads your latest messages in the session: a line you wrote out passes, and content you told the agent to keep is judged with your words in view. "Remember this" alone does not count; the agent still has to write a general rule.
 
 ## Cleaning existing files
 

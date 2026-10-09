@@ -277,6 +277,48 @@ class JudgeTest(unittest.TestCase):
         self.assertIn("넣었다가", self.review("Edit", {"file_path": str(path), "old_string": "x",
                                                     "new_string": "- 넣었다가 다시 뺐다."}))
 
+    def transcript(self, *rows: dict) -> list[str]:
+        path = self.root / "session.jsonl"
+        path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
+        return self.guard.user_messages(str(path))
+
+    def test_user_messages_from_claude_transcript(self):
+        said = self.transcript(
+            {"type": "user", "message": {"role": "user", "content": "벤 다이어그램 예시는 남겨 둬."}},
+            {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}},
+            {"type": "user", "isMeta": True, "message": {"role": "user", "content": "meta"}},
+            {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "<system-reminder>x</system-reminder>"},
+                                                                      {"type": "text", "text": "그대로 두고 커밋해."}]}},
+            {"type": "assistant", "message": {"role": "assistant", "content": "done"}})
+        self.assertEqual(said, ["벤 다이어그램 예시는 남겨 둬.", "그대로 두고 커밋해."])
+
+    def test_user_messages_from_codex_transcript(self):
+        def user(text):
+            return {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                         "content": [{"type": "input_text", "text": text}]}}
+        said = self.transcript(user("# AGENTS.md instructions for /tmp\n..."), user("<environment_context>x"),
+                               user("여백은 넉넉히 두라고 적어 줘."))
+        self.assertEqual(said, ["여백은 넉넉히 두라고 적어 줘."])
+        self.assertEqual(self.guard.user_messages(str(self.root / "missing.jsonl")), [])
+
+    def test_line_the_user_wrote_out_is_never_refused(self):
+        path = self.write("# Rules\nx\n")
+        line = "- 10월 5일 이후 만든 영상은 자막을 두 줄로 쓴다."
+        said = [f"AGENTS.md에 '{line}' 줄을 넣어 줘."]
+        edit = ("Edit", {"file_path": str(path), "old_string": "x", "new_string": line})
+        self.assertIsNotNone(self.review(*edit))
+        self.answer = {"ok": False, "problems": [{"line": line, "kind": "provenance", "fix": "drop the date"}]}
+        [(p, before, after)] = self.guard.claude_changes(*edit, str(self.root))
+        self.assertIsNone(self.guard.review("claude", p, before, after, said))
+
+    def test_judge_sees_the_user_messages(self):
+        path = self.write("# Rules\nx\n")
+        [(p, before, after)] = self.guard.claude_changes(
+            "Edit", {"file_path": str(path), "old_string": "x", "new_string": "- Keep the Venn diagram example."},
+            str(self.root))
+        self.guard.review("claude", p, before, after, ["Keep the example as it is."])
+        self.assertEqual(self.section(self.messages[0] + "\n\n[", "USER MESSAGES"), "---\nKeep the example as it is.")
+
     def test_partial_edit_shows_whole_old_and_new_line(self):
         path = self.write("# Rules\n- Keep captions to two lines.\n- Run tests before committing.\n")
         self.review("Edit", {"file_path": str(path), "old_string": "two", "new_string": "three"})

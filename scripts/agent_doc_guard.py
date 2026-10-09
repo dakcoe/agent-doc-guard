@@ -11,7 +11,10 @@ they carry that kind of content, telling the agent which lines to rewrite as gen
 File edits (Claude Code: Edit/Write/MultiEdit, Codex: apply_patch): the whole file after the edit is
   built first and compared with the file before it. The words an edit adds go through fixed patterns
   for dates, then a small model judges the changed lines from the diff. With the judge off, or when it
-  cannot be reached, the patterns for feedback history and past incidents are applied as well. Lines that are only removed are never checked, and lines
+  cannot be reached, the patterns for feedback history and past incidents are applied as well.
+  The user's latest messages are read from the session transcript: a line the user wrote out is never
+  refused, and the judge sees the messages so it can tell content the user asked for from the agent's
+  own account of what happened. Lines that are only removed are never checked, and lines
   the edit leaves alone are left to the doc-cleanup skill.
 Bash: a command that visibly writes to an instruction file is refused before it runs. Whatever it
   misses is caught afterwards: instruction files are saved before the command and compared after it;
@@ -56,6 +59,10 @@ LOG_NAME = re.compile(r"^(?:CHANGELOG|CHANGES|HISTORY|RELEASE[-_]?NOTES)\b.*\.md
 MAX_DOC_CHARS = 24_000
 # diff text per judge call; a bigger rewrite is judged in several calls, split at hunk boundaries
 MAX_DIFF_CHARS = 5_000
+# the user's latest messages shown to the judge
+USER_MESSAGES = 3
+USER_CHARS = 1_500
+TRANSCRIPT_TAIL = 2_000_000
 HANGUL = re.compile(r"[가-힣]")
 
 DATE_PATTERNS = [
@@ -91,6 +98,10 @@ When a `+` line is a changed version of a nearby `-` line, judge only the words 
 Lines that start with `-` are removed by this edit and are not in the file afterwards; never treat them as something a `+` line duplicates.
 Lines that start with a space are unchanged context; do not report them.
 [FILE AFTER EDIT] is the whole file once the edit is applied, without diff markers.
+[USER MESSAGES] are the user's latest messages in the session that made the edit.
+A `+` line that carries content the user stated, or told the agent to keep, is fine.
+A request to remember or record something ("remember this", "add this to AGENTS.md") does not make the agent's
+own account of what happened fine: that still has to become a general rule.
 
 Find `+` lines that fall into one of these kinds:
 1. provenance: dates, who pointed out what and when, which task/video/file something happened in, quotes of the user.
@@ -459,6 +470,48 @@ def squash(text: str) -> str:
     return text
 
 
+def user_messages(transcript: str | None) -> list[str]:
+    """The user's latest messages from a Claude Code or Codex session transcript, newest last.
+    Text the host adds in the user's place (reminders, injected AGENTS.md, command output) starts
+    with a tag or heading and is skipped."""
+    if not transcript:
+        return []
+    try:
+        with open(transcript, "rb") as f:
+            f.seek(max(0, os.path.getsize(transcript) - TRANSCRIPT_TAIL))
+            rows = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for row in rows:
+        try:
+            d = json.loads(row)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        payload = d.get("payload") or {}
+        if d.get("type") == "user" and not d.get("isMeta"):
+            content = (d.get("message") or {}).get("content")  # Claude Code
+        elif d.get("type") == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+            content = payload.get("content")  # Codex
+        else:
+            continue
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for item in content or []:
+            text = (item.get("text") or "").strip() if isinstance(item, dict) and item.get("type") in ("text", "input_text") else ""
+            if text and not text.startswith(("<", "# AGENTS.md instructions")):
+                out.append(text[:USER_CHARS])
+    return out[-USER_MESSAGES:]
+
+
+def dictated(line: str, said: list[str]) -> bool:
+    """Whether the user wrote this line out in one of their messages."""
+    text = squash(line)
+    return len(text) >= 8 and any(text in squash(m) for m in said)
+
+
 def on_added_line(problem: dict, lines: list[str]) -> bool:
     """Whether the judge's `line` points at one of the added lines: equal or the start of one once
     spaces and leading marks are normalized. A problem pointing elsewhere is about a line this edit
@@ -469,14 +522,15 @@ def on_added_line(problem: dict, lines: list[str]) -> bool:
     return any(squash(l).startswith(quoted) for l in lines)
 
 
-def judge_once(host: str, path: Path, after: str, batch: list[list[str]], lang: str) -> list[str] | None:
+def judge_once(host: str, path: Path, after: str, batch: list[list[str]], lang: str, said: list[str]) -> list[str] | None:
     diff = "\n".join(l for h in batch for l in h)
     message = (
         f"[FILE] {path}\n\n[FIX LANGUAGE] {'Korean' if lang == 'ko' else 'English'}\n\n"
         f"[DIFF]\n{diff}\n\n"
-        f"[FILE AFTER EDIT]\n{after[:MAX_DOC_CHARS]}"
+        f"[FILE AFTER EDIT]\n{after[:MAX_DOC_CHARS]}\n\n"
+        f"[USER MESSAGES]\n{chr(10).join('---' + chr(10) + m for m in said) or '(none)'}"
     )
-    lines = added_lines(batch)
+    lines = [l for l in added_lines(batch) if not dictated(l, said)]
     env = {**os.environ, GUARD_ENV: "1"}
     ask = ask_codex if host == "codex" else ask_claude
     for _ in range(2):
@@ -489,12 +543,12 @@ def judge_once(host: str, path: Path, after: str, batch: list[list[str]], lang: 
     return None
 
 
-def judge(host: str, path: Path, after: str, hunks: list[list[str]], lang: str) -> list[str] | None:
+def judge(host: str, path: Path, after: str, hunks: list[list[str]], lang: str, said: list[str]) -> list[str] | None:
     """Problems found by the judge model; [] if none, None if any batch could not be judged.
     A large rewrite is judged in batches, several at once."""
     groups = batches(hunks)
     with ThreadPoolExecutor(max_workers=min(8, len(groups))) as pool:
-        results = list(pool.map(lambda b: judge_once(host, path, after, b, lang), groups))
+        results = list(pool.map(lambda b: judge_once(host, path, after, b, lang, said), groups))
     problems = [p for r in results if r for p in r]
     if problems:
         return problems
@@ -603,8 +657,9 @@ def check_bash(host: str, command: str, cwd: str) -> None:
             emit_deny(MESSAGES[language(read(p) + command)]["bash"].format(path=p, tool=EDIT_TOOL[host]))
 
 
-def review(host: str, path: Path, before: str, after: str) -> str | None:
-    """Reason to refuse an edit that turns `path` from `before` into `after`, or None if it may stay."""
+def review(host: str, path: Path, before: str, after: str, said: list[str] = ()) -> str | None:
+    """Reason to refuse an edit that turns `path` from `before` into `after`, or None if it may stay.
+    `said` holds the user's latest messages."""
     if not is_reference(path):
         return None
     hunks = diff_hunks(before, after)
@@ -614,13 +669,13 @@ def review(host: str, path: Path, before: str, after: str) -> str | None:
     lang = language(after + "\n".join(lines))
     msg = MESSAGES[lang]
     header = msg["header"].format(name=path.name)
-    added = new_words(hunks)
+    added = [(line, spans) for line, spans in new_words(hunks) if not dictated(line, said)]
     found = pattern_problems(added, DATE_PATTERNS if JUDGE_ON else PATTERNS)
     if found:
         return header + "\n".join(found)
     if not JUDGE_ON:
         return None
-    problems = judge(host, path, after, hunks, lang)
+    problems = judge(host, path, after, hunks, lang, list(said))
     if problems is None:
         if STRICT:
             return msg["judge_failed_strict"].format(name=path.name)
@@ -632,8 +687,8 @@ def review(host: str, path: Path, before: str, after: str) -> str | None:
     return header + "\n".join(problems) if problems else None
 
 
-def check_file(host: str, path: Path, before: str, after: str) -> None:
-    reason = review(host, path, before, after)
+def check_file(host: str, path: Path, before: str, after: str, said: list[str]) -> None:
+    reason = review(host, path, before, after, said)
     if reason:
         emit_deny(reason)
 
@@ -733,7 +788,7 @@ def check_bash_result(host: str, data: dict) -> None:
         new = read(p)
         if new == old or not p.exists():
             continue  # unchanged, or deleted
-        reason = review(host, p, old, new)
+        reason = review(host, p, old, new, user_messages(data.get("transcript_path")))
         if reason:
             if p.is_symlink():
                 # saved paths are resolved, so a link here was made by the command; writing through
@@ -775,10 +830,10 @@ def main() -> None:
         return
     elif tool == "apply_patch":
         for path, before, after in codex_changes(inp.get("command", ""), cwd):
-            check_file(host, path, before, after)
+            check_file(host, path, before, after, user_messages(data.get("transcript_path")))
     elif tool in ("Edit", "Write", "MultiEdit"):
         for path, before, after in claude_changes(tool, inp, cwd):
-            check_file(host, path, before, after)
+            check_file(host, path, before, after, user_messages(data.get("transcript_path")))
 
 
 if __name__ == "__main__":
