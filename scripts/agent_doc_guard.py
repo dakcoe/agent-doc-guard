@@ -541,6 +541,13 @@ def write_targets(words: list[str], cwd: str, line: str) -> list[Path]:
     elif name == "rm":
         targets += files
     elif name in ("cp", "mv", "install") and len(files) >= 2:
+        # -t DIR / --target-directory=DIR names the destination first; the rest are sources
+        folder = next((a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")), None)
+        if "-t" in args and args.index("-t") + 1 < len(args):
+            folder = args[args.index("-t") + 1]
+        if folder is not None:
+            sources = [f for f in files if f != folder]
+            return [resolve(t, cwd) for t in targets] + [resolve(folder, cwd) / Path(f).name for f in sources]
         dest = resolve(files[-1], cwd)
         if dest.is_dir():
             return [resolve(t, cwd) for t in targets] + [dest / Path(f).name for f in files[:-1]]

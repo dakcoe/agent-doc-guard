@@ -110,7 +110,8 @@ class GuardTest(unittest.TestCase):
 
     def test_bash_read_with_unrelated_write_passes(self):
         for c in ["diff -u notes.md AGENTS.md > out.diff && rm out.diff", "diff notes.md AGENTS.md > /tmp/x.md",
-                  "grep rule AGENTS.md | tee out.txt", "sed -i '' s/a/b/ notes.md && cat AGENTS.md"]:
+                  "grep rule AGENTS.md | tee out.txt", "sed -i '' s/a/b/ notes.md && cat AGENTS.md",
+                  "mkdir -p out && cp -t out notes.md docs/style.md"]:
             self.assertFalse(denied(self.bash(c)), c)
 
     def test_backup_copy_of_agent_folder_is_not_an_instruction_file(self):
