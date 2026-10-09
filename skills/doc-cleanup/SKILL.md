@@ -40,6 +40,7 @@ For each **rewrite** file:
 - Move a long list of collected cases (words that fail, known errors) into a data file such as a `.tsv`, and point to it from the file with one line saying when to look it up and when to add to it.
 - Keep templates that show the form of good output (a command format, a pair contrasting a wording to avoid with the wording to use); drop only the story attached to them.
 - Keep the file's language, voice, headings that still serve, tables, commands and paths exactly.
+- Leave the frontmatter fields `originSessionId` and `modified` in Claude Code memory files as they are; the harness rewrites them on every save.
 - Write with the edit tool (Claude Code: Edit/Write, Codex: apply_patch), so agent-doc-guard reviews the new lines. Follow its notes. When a note would delete a fact, keep the fact and reword it as a plain statement.
 
 Rewrite the first file, show it to the user with a short list of what was dropped, and wait for their go-ahead before the rest. Their correction calibrates the remaining files.
@@ -50,4 +51,4 @@ Done for a file when the guard accepts the write and every fact from the backup 
 
 For each file: lines before → after, facts deliberately dropped, and anything left for the user to decide. Give the backup path. In a public repository, leave committing to the user.
 
-Done when every rewrite file has its line in the report.
+Done when the report, checked against the step 1 list, misses no file and every rewrite file has its line.
