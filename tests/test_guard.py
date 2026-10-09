@@ -91,6 +91,20 @@ class GuardTest(unittest.TestCase):
         (self.root / "docs" / "style.md").write_text("# Style\nFixed on 2026-10-05.\n")
         self.assertFalse(denied(self.edit("docs/style.md", "", old="Fixed on 2026-10-05.")))
 
+    def test_words_already_in_the_line_are_not_checked_again(self):
+        (self.root / "docs" / "style.md").write_text("# Style\n- 지적한 부분만 고친다.\n")
+        self.assertFalse(denied(self.edit("docs/style.md", "- 지적한 부분만 고치고 폰트는 그대로 둔다.",
+                                          old="- 지적한 부분만 고친다.")))
+        self.assertTrue(denied(self.edit("docs/style.md", "- 지적한 부분만 고친다. 10월 5일에 정했다.",
+                                         old="- 지적한 부분만 고친다.")))
+        (self.root / "docs" / "style.md").write_text("# Style\n- 10월 3일부터 자막은 두 줄로 쓴다.\n")
+        self.assertTrue(denied(self.edit("docs/style.md", "- 10월 5일부터 자막은 두 줄로 쓴다.",
+                                         old="- 10월 3일부터 자막은 두 줄로 쓴다.")))
+
+    def test_message_names_the_matched_words(self):
+        reason = self.edit("docs/style.md", "넣었다가 다시 뺐다.")["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn('[past incident] "넣었다가"', reason)
+
     def test_message_follows_file_language(self):
         reason = self.edit("docs/style.md", "10월 3일에 겹쳤다.")["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertIn("지침 문서", reason)
@@ -245,6 +259,23 @@ class JudgeTest(unittest.TestCase):
     @staticmethod
     def section(message: str, name: str) -> str:
         return message.split(f"[{name}]\n", 1)[1].split("\n\n[", 1)[0]
+
+    def test_with_the_judge_only_dates_are_refused_by_pattern(self):
+        path = self.write("# Rules\nx\n")
+        self.assertIsNone(self.review("Edit", {"file_path": str(path), "old_string": "x",
+                                               "new_string": "- 지적한 부분만 고친다."}))
+        self.assertEqual(len(self.messages), 1)
+        self.assertIn("2026-10-05", self.review("Edit", {"file_path": str(path), "old_string": "x",
+                                                         "new_string": "- Fixed on 2026-10-05."}))
+        self.assertEqual(len(self.messages), 1)
+
+    def test_word_patterns_apply_when_the_judge_fails(self):
+        def broken(message, env):
+            raise RuntimeError
+        self.guard.ask_claude = broken
+        path = self.write("# Rules\nx\n")
+        self.assertIn("넣었다가", self.review("Edit", {"file_path": str(path), "old_string": "x",
+                                                    "new_string": "- 넣었다가 다시 뺐다."}))
 
     def test_partial_edit_shows_whole_old_and_new_line(self):
         path = self.write("# Rules\n- Keep captions to two lines.\n- Run tests before committing.\n")

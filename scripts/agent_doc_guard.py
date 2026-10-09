@@ -9,8 +9,9 @@ judgement. This hook checks the lines an edit adds to such a file and refuses th
 they carry that kind of content, telling the agent which lines to rewrite as general rules.
 
 File edits (Claude Code: Edit/Write/MultiEdit, Codex: apply_patch): the whole file after the edit is
-  built first and compared with the file before it. Added and changed lines go through fixed patterns,
-  then a small model judges them from the diff. Lines that are only removed are never checked, and lines
+  built first and compared with the file before it. The words an edit adds go through fixed patterns
+  for dates, then a small model judges the changed lines from the diff. With the judge off, or when it
+  cannot be reached, the patterns for feedback history and past incidents are applied as well. Lines that are only removed are never checked, and lines
   the edit leaves alone are left to the doc-cleanup skill.
 Bash: a command that visibly writes to an instruction file is refused before it runs. Whatever it
   misses is caught afterwards: instruction files are saved before the command and compared after it;
@@ -57,11 +58,13 @@ MAX_DOC_CHARS = 24_000
 MAX_DIFF_CHARS = 5_000
 HANGUL = re.compile(r"[가-힣]")
 
-PATTERNS = [
-    # dates
+DATE_PATTERNS = [
     (r"(?<!\d)20\d{2}-\d{1,2}-\d{1,2}(?!\d)", "date"),
     (r"\d{1,2}월 ?\d{1,2}일", "date"),
     (r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.? \d{1,2}(?:st|nd|rd|th)?\b", "date"),
+]
+# These words also turn up in general rules, so they are only used when no judge model checks the edit
+WORD_PATTERNS = [
     # who said what
     (r"지적(?:을)? ?받|지적했|지적한", "feedback history"),
     (r"라고 (?:했|말했|하더라)|다고 (?:했|말했)", "quoting the user"),
@@ -75,6 +78,7 @@ PATTERNS = [
     (r"에서 더한 것|때 더한 것|에서 배운 것", "per-task log"),
     (r"\blessons? learned\b|\b(?:added|learned) (?:from|after|during) (?:the|this|that) ", "per-task log"),
 ]
+PATTERNS = DATE_PATTERNS + WORD_PATTERNS
 
 JUDGE_PROMPT = """You review a proposed edit to an instruction file that AI agents read. Give it your full effort.
 
@@ -83,6 +87,7 @@ anything fitted to one past event narrows the judgement of agents working on unr
 The file must stay short, clear and simple.
 
 [DIFF] is a unified diff of the edit. Judge only the lines that start with `+`: they are added or changed by this edit.
+When a `+` line is a changed version of a nearby `-` line, judge only the words the edit added or changed; the words it kept were already in the file.
 Lines that start with `-` are removed by this edit and are not in the file afterwards; never treat them as something a `+` line duplicates.
 Lines that start with a space are unchanged context; do not report them.
 [FILE AFTER EDIT] is the whole file once the edit is applied, without diff markers.
@@ -334,12 +339,16 @@ def codex_changes(patch: str, cwd: str) -> list[Change]:
     return changes
 
 
-def pattern_problems(lines: list[str]) -> list[str]:
+def pattern_problems(added: list[tuple[str, list[tuple[int, int]]]], patterns: list[tuple[str, str]]) -> list[str]:
+    """One entry per added line with a pattern match that takes in at least one new word, naming the match.
+    The whole line is searched, so a match made of a kept word and a new one ("10월" + "5일") still counts."""
     found = []
-    for line in lines:
-        for pattern, kind in PATTERNS:
-            if re.search(pattern, line, re.IGNORECASE):
-                found.append(f"- [{kind}] {line.strip()[:80]}")
+    for line, spans in added:
+        for pattern, kind in patterns:
+            m = next((m for m in re.finditer(pattern, line, re.IGNORECASE)
+                      if any(m.start() < end and start < m.end() for start, end in spans)), None)
+            if m:
+                found.append(f"- [{kind}] \"{m.group(0)}\": {line.strip()[:80]}")
                 break
     return found
 
@@ -381,6 +390,36 @@ def diff_hunks(before: str, after: str) -> list[list[str]]:
 
 def added_lines(hunks: list[list[str]]) -> list[str]:
     return [l[1:] for h in hunks for l in h[1:] if l.startswith("+") and l[1:].strip()]
+
+
+def new_words(hunks: list[list[str]]) -> list[tuple[str, list[tuple[int, int]]]]:
+    """Each added line with the character spans of the words it brings in. A `+` line that rewrites a
+    `-` line next to it is compared with that line word by word, so the words it keeps are not new."""
+    out = []
+    for h in hunks:
+        removed: list[str] = []
+        for l in h[1:]:
+            if l.startswith("-"):
+                removed.append(l[1:])
+                continue
+            if not l.startswith("+"):
+                removed = []
+                continue
+            line = l[1:]
+            if not line.strip():
+                continue
+            found = list(re.finditer(r"\S+", line))
+            words = [w.group(0) for w in found]
+            best = max(removed, key=lambda r: difflib.SequenceMatcher(None, r.split(), words).ratio(), default=None)
+            matcher = difflib.SequenceMatcher(None, best.split() if best else [], words)
+            if best is None or matcher.ratio() < 0.5:
+                out.append((line, [(0, len(line))]))
+                continue
+            spans = [(found[j1].start(), found[j2 - 1].end())
+                     for op, _, _, j1, j2 in matcher.get_opcodes() if op in ("insert", "replace")]
+            if spans:
+                out.append((line, spans))
+    return out
 
 
 def batches(hunks: list[list[str]]) -> list[list[list[str]]]:
@@ -575,7 +614,8 @@ def review(host: str, path: Path, before: str, after: str) -> str | None:
     lang = language(after + "\n".join(lines))
     msg = MESSAGES[lang]
     header = msg["header"].format(name=path.name)
-    found = pattern_problems(lines)
+    added = new_words(hunks)
+    found = pattern_problems(added, DATE_PATTERNS if JUDGE_ON else PATTERNS)
     if found:
         return header + "\n".join(found)
     if not JUDGE_ON:
@@ -584,6 +624,9 @@ def review(host: str, path: Path, before: str, after: str) -> str | None:
     if problems is None:
         if STRICT:
             return msg["judge_failed_strict"].format(name=path.name)
+        found = pattern_problems(added, WORD_PATTERNS)
+        if found:
+            return header + "\n".join(found)
         print(json.dumps({"systemMessage": msg["judge_failed"].format(name=path.name)}, ensure_ascii=False))
         return None
     return header + "\n".join(problems) if problems else None
