@@ -61,15 +61,14 @@ Third-party marketplaces do not update on their own. In Claude Code, turn on aut
 
 </details>
 
-Needs `python3`. The check runs on the agent you are using: `claude -p` under Claude Code, `codex exec` under Codex.
+Needs `python3`.
 
 ## What it checks
 
 - Edits to `AGENTS.md`, `CLAUDE.md`, `SKILL.md`, files under `.claude/`, and docs your AGENTS.md links to.
-- New lines with dates, past incidents, one-off special cases or repeated rules are sent back to the agent with the reason.
-- Shell commands are covered too: those files are compared before and after each command, and a change that fails the check is put back.
+- The first edit that adds lines to such a file in a session is sent back once, with the rules and the lines it would add (dates marked). The agent rewrites what breaks the rules, or retries as is.
+- Shell commands are never blocked or undone. A command that writes into one of those files gets a note afterwards asking the agent to review what it wrote. Copying, cloning, moving and deleting files are left alone.
 - Deleting lines is always allowed. English and Korean.
-- What you asked for goes through. The check reads your latest messages in the session: a line you wrote out passes, and content you told the agent to keep is judged with your words in view. "Remember this" alone does not count; the agent still has to write a general rule.
 
 ## Cleaning existing files
 
@@ -77,10 +76,10 @@ The hook stops new sediment. For files that already have it, the plugin ships a 
 
 ## Settings
 
-- `AGENT_DOC_GUARD_JUDGE=off`: pattern check only, no model call.
+- `AGENT_DOC_GUARD_JUDGE=on`: also check every later edit with a model, which refuses lines with dates, history or one-off cases. It runs on the agent you are using (`claude -p` under Claude Code, `codex exec` under Codex) and reads your latest messages, so a line you wrote out passes. Off by default.
 - `AGENT_DOC_GUARD_CLAUDE_MODEL`: judge model under Claude Code (default `haiku`).
 - `AGENT_DOC_GUARD_CODEX_MODEL`: judge model under Codex (default `gpt-6-luna`).
-- `AGENT_DOC_GUARD_STRICT=1`: refuse the edit when the judge cannot be reached (default: allow and warn).
+- `AGENT_DOC_GUARD_STRICT=1`: with the judge on, refuse the edit when the judge cannot be reached (default: allow and warn).
 
 ## License
 

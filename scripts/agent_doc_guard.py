@@ -5,35 +5,34 @@ Agents re-read instruction files such as AGENTS.md, CLAUDE.md and skills on ever
 When an agent edits one of them after a single piece of feedback, it tends to write down the
 incident instead of the rule: dates, who said what, what went wrong last time, a special case
 for that one situation. Those lines stay in every future prompt and narrow the next agent's
-judgement. This hook checks the lines an edit adds to such a file and refuses the edit when
-they carry that kind of content, telling the agent which lines to rewrite as general rules.
+judgement. This hook puts the rules for such a file in front of the agent before it adds to it.
 
-File edits (Claude Code: Edit/Write/MultiEdit, Codex: apply_patch): the whole file after the edit is
-  built first and compared with the file before it. The words an edit adds go through fixed patterns
-  for dates, then a small model judges the changed lines from the diff. With the judge off, or when it
-  cannot be reached, the patterns for feedback history and past incidents are applied as well.
-  The user's latest messages are read from the session transcript: a line the user wrote out is never
-  refused, and the judge sees the messages so it can tell content the user asked for from the agent's
-  own account of what happened. Lines that are only removed are never checked, and lines
-  the edit leaves alone are left to the doc-cleanup skill.
-Bash: a command that visibly writes to an instruction file is refused before it runs. Whatever it
-  misses is caught afterwards: instruction files are saved before the command and compared after it;
-  a change that fails the same review is put back and the agent is told why.
+File edits (Claude Code: Edit/Write/MultiEdit, Codex: apply_patch): the first edit that adds lines to an
+  instruction file in a session is refused once. The refusal states the rules and lists the lines the
+  edit would add, with any dates in them marked, so the agent reviews its own lines; the retry goes
+  through. Edits that only remove lines are never stopped.
+Bash: nothing is refused or put back. When a command visibly writes to an instruction file, the agent
+  is told afterwards to review what it wrote and to make such changes with its edit tool.
 
-The judge runs on the agent that called the hook: `claude -p` under Claude Code, `codex exec`
-under Codex. If it cannot be reached, the edit is allowed and the user sees a notice
-(set AGENT_DOC_GUARD_STRICT=1 to refuse instead).
+Optional judge (AGENT_DOC_GUARD_JUDGE=on): every later edit is also checked. The words an edit adds go
+  through fixed patterns for dates, then a small model judges the changed lines from the diff, with the
+  user's latest messages from the session transcript in view; a line the user wrote out is never refused.
+  The judge runs on the agent that called the hook: `claude -p` under Claude Code, `codex exec` under
+  Codex. If it cannot be reached, the patterns for feedback history and past incidents are applied, the
+  edit is allowed and the user sees a notice (set AGENT_DOC_GUARD_STRICT=1 to refuse instead).
 
 Environment:
+  AGENT_DOC_GUARD_JUDGE          set to "on" to judge every edit after the first (default: off)
   AGENT_DOC_GUARD_CLAUDE_MODEL   judge model under Claude Code (default: haiku)
   AGENT_DOC_GUARD_CODEX_MODEL    judge model under Codex (default: gpt-6-luna)
-  AGENT_DOC_GUARD_JUDGE          set to "off" to use the patterns only
   AGENT_DOC_GUARD_STRICT         set to "1" to refuse edits when the judge cannot be reached
+  AGENT_DOC_GUARD_STATE_DIR      where the files already shown to the agent are recorded
 """
 
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -49,8 +48,13 @@ HOME = Path.home()
 GUARD_ENV = "AGENT_DOC_GUARD_ACTIVE"
 CLAUDE_MODEL = os.environ.get("AGENT_DOC_GUARD_CLAUDE_MODEL", "haiku")
 CODEX_MODEL = os.environ.get("AGENT_DOC_GUARD_CODEX_MODEL", "gpt-6-luna")
-JUDGE_ON = os.environ.get("AGENT_DOC_GUARD_JUDGE", "on").lower() != "off"
+JUDGE_ON = os.environ.get("AGENT_DOC_GUARD_JUDGE", "off").lower() == "on"
 STRICT = os.environ.get("AGENT_DOC_GUARD_STRICT", "") == "1"
+STATE_DIR = Path(os.environ.get("AGENT_DOC_GUARD_STATE_DIR") or Path(tempfile.gettempdir()) / "agent-doc-guard")
+# a session's record of files already shown is dropped once it has been idle this long
+STATE_TTL = 24 * 3600
+# added lines quoted back to the agent on the first edit
+SHOWN_LINES = 30
 NAMES = {"AGENTS.md", "CLAUDE.md", "GEMINI.md", "SKILL.md", "MEMORY.md"}
 AGENT_HOMES = [HOME / ".claude", HOME / ".codex"]
 NOT_REFERENCE = [HOME / ".claude" / "plans"]
@@ -70,7 +74,7 @@ DATE_PATTERNS = [
     (r"\d{1,2}월 ?\d{1,2}일", "date"),
     (r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.? \d{1,2}(?:st|nd|rd|th)?\b", "date"),
 ]
-# These words also turn up in general rules, so they are only used when no judge model checks the edit
+# These words also turn up in general rules, so they are only used when the judge model cannot be reached
 WORD_PATTERNS = [
     # who said what
     (r"지적(?:을)? ?받|지적했|지적한", "feedback history"),
@@ -85,7 +89,6 @@ WORD_PATTERNS = [
     (r"에서 더한 것|때 더한 것|에서 배운 것", "per-task log"),
     (r"\blessons? learned\b|\b(?:added|learned) (?:from|after|during) (?:the|this|that) ", "per-task log"),
 ]
-PATTERNS = DATE_PATTERNS + WORD_PATTERNS
 
 JUDGE_PROMPT = """You review a proposed edit to an instruction file that AI agents read. Give it your full effort.
 
@@ -146,14 +149,26 @@ MESSAGES = {
             "no dates, history, anecdotes, case-specific examples, special cases from one event, repeated rules, or lines that change nothing. "
             "Rewrite these lines as one general rule each, or drop them, then edit again.\n"
         ),
+        "gate": (
+            "{name} is an instruction file that agents re-read on every task, so every line in it costs tokens and "
+            "steers unrelated work. Before adding to it, check each line this edit adds:\n"
+            "- It states a general rule, or a fact an agent cannot know on its own (a location, command, path, environment detail, limit).\n"
+            "- No dates, who said what, or an account of what happened. Turn the lesson from one event into a general rule.\n"
+            "- No special case that came from one situation, no example that records a specific case, "
+            "no rule the file already states, no line whose removal would change nothing.\n"
+            "- Text the user wrote out, or a file brought in from elsewhere, stays as it is.\n\n"
+            "Lines this edit adds:\n{lines}\n\n"
+            "Rewrite or drop the lines that break these rules and edit again. If they are fine, retry the same edit."
+        ),
+        "dates": "Dates in these lines:\n{dates}",
+        "more": "… and {n} more lines",
         "bash": (
-            "{path} is an instruction file that agents re-read on every task. Do not change it with a shell command; "
-            "use {tool} so the change is checked. If the command only reads the file, remove the part that "
-            "looks like a write (redirect, sed -i, write call) and run it again."
+            "{paths}: instruction files that agents re-read on every task. If this command added lines to them, "
+            "check those lines against the rules for such files (general rules and facts only; no dates, history "
+            "or one-off special cases) and fix them with {tool}. Make future changes to these files with {tool}."
         ),
         "judge_failed": "agent-doc-guard: could not reach the judge model for {name}; only the pattern check was applied.",
         "judge_failed_strict": "agent-doc-guard: could not reach the judge model for {name}, and strict mode refuses unchecked edits. Try again.",
-        "reverted": "Your command changed an instruction file in a way that did not pass review, so the change was put back. Make the edit with {tool} instead, following the notes below.",
     },
     "ko": {
         "header": (
@@ -161,14 +176,25 @@ MESSAGES = {
             "날짜·경위·사례·특정 사례의 예시·한 번 있었던 일에서 나온 좁은 조건·같은 규칙의 반복·지워도 할 일이 바뀌지 않는 문장은 넣지 않습니다. "
             "아래 줄을 일반 규칙 한 줄로 다시 쓰거나 빼고 다시 고치세요.\n"
         ),
+        "gate": (
+            "{name} 은 에이전트가 작업마다 다시 읽는 지침 문서입니다. 한 줄 한 줄이 매 작업의 토큰이 되고 상관없는 작업의 판단에도 영향을 줍니다. "
+            "추가하기 전에 이번 수정이 넣는 줄을 하나씩 확인하세요.\n"
+            "- 일반 규칙이거나, 에이전트가 스스로 알 수 없는 사실(위치, 명령, 경로, 환경, 한계값)인지.\n"
+            "- 날짜, 누가 무엇을 말했는지, 있었던 일의 경위가 없는지. 한 번 있었던 일에서 얻은 교훈은 일반 규칙으로 바꿉니다.\n"
+            "- 한 상황에서 나온 좁은 조건, 특정 사례를 기록한 예시, 문서에 이미 있는 규칙의 반복, 지워도 할 일이 바뀌지 않는 문장이 없는지.\n"
+            "- 사용자가 직접 쓴 문장이나 다른 곳에서 가져온 파일은 그대로 둡니다.\n\n"
+            "이번 수정이 넣는 줄:\n{lines}\n\n"
+            "규칙에 어긋나는 줄은 다시 쓰거나 빼고 다시 고치세요. 문제가 없으면 같은 수정을 다시 시도하세요."
+        ),
+        "dates": "날짜가 들어간 줄:\n{dates}",
+        "more": "… 외 {n}줄",
         "bash": (
-            "{path} 는 에이전트가 작업마다 다시 읽는 지침 문서입니다. 셸 명령으로 고치지 말고 {tool} 로 고치세요. "
-            "그래야 검사를 거칩니다. 읽기만 하는 명령이었다면 쓰기로 보이는 부분(리다이렉트, sed -i, write 호출)을 "
-            "빼고 다시 실행하세요."
+            "{paths}: 에이전트가 작업마다 다시 읽는 지침 문서입니다. 이 명령이 여기에 줄을 넣었다면 그 줄이 "
+            "지침 문서 규칙(일반 규칙과 사실만, 날짜·경위·한 번 있었던 일에서 나온 좁은 조건은 넣지 않음)에 맞는지 확인하고 "
+            "{tool} 로 고치세요. 앞으로 이 문서는 {tool} 로 고치세요."
         ),
         "judge_failed": "agent-doc-guard: {name} 판정 모델 호출에 실패해 패턴 검사만 적용했습니다.",
         "judge_failed_strict": "agent-doc-guard: {name} 판정 모델 호출에 실패했고, 엄격 모드라 검사하지 못한 수정은 막습니다. 다시 시도하세요.",
-        "reverted": "명령이 지침 문서를 검사를 통과하지 못하는 내용으로 바꿔서 원래대로 되돌렸습니다. 아래 내용을 반영해 {tool} 로 다시 고치세요.",
     },
 }
 EDIT_TOOL = {"claude": "the Edit tool", "codex": "apply_patch"}
@@ -605,8 +631,9 @@ def simple_commands(command: str, cwd: str) -> list[tuple[list[str], str, str]]:
 
 
 def write_targets(words: list[str], cwd: str, line: str) -> list[Path]:
-    """Files one simple command writes, as far as its words show: redirect targets, tee files,
-    sed -i / perl -i files, rm arguments, the cp/mv destination, and .md paths in code that writes."""
+    """Files one simple command writes text into, as far as its words show: redirect targets, tee
+    files, sed -i / perl -i files, and .md paths in code that writes. Copies, moves and deletions bring
+    in or drop whole files and are left alone."""
     targets, args = [], []
     skip = False
     for i, w in enumerate(words):
@@ -623,43 +650,76 @@ def write_targets(words: list[str], cwd: str, line: str) -> list[Path]:
     if WRITE_IN_CODE.search(line):
         # code is not shell words; take the .md paths from the line as written
         targets += MD_TOKEN.findall(line)
-    if not args:
-        return [resolve(t, cwd) for t in targets]
-    name = os.path.basename(args[0])
-    files = [a for a in args[1:] if not a.startswith("-")]
-    if name == "tee":
-        targets += files
-    elif name in ("sed", "gsed", "perl") and any(re.match(r"^-[A-Za-z]*i|^--in-place", a) for a in args[1:]):
-        targets += [a for a in files if a.endswith(".md")]
-    elif name == "rm":
-        targets += files
-    elif name in ("cp", "mv", "install") and len(files) >= 2:
-        # -t DIR / --target-directory=DIR names the destination first; the rest are sources
-        folder = next((a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")), None)
-        if "-t" in args and args.index("-t") + 1 < len(args):
-            folder = args[args.index("-t") + 1]
-        if folder is not None:
-            sources = [f for f in files if f != folder]
-            return [resolve(t, cwd) for t in targets] + [resolve(folder, cwd) / Path(f).name for f in sources]
-        dest = resolve(files[-1], cwd)
-        if dest.is_dir():
-            return [resolve(t, cwd) for t in targets] + [dest / Path(f).name for f in files[:-1]]
-        targets.append(files[-1])
+    if args:
+        name = os.path.basename(args[0])
+        files = [a for a in args[1:] if not a.startswith("-")]
+        if name == "tee":
+            targets += files
+        elif name in ("sed", "gsed", "perl") and any(re.match(r"^-[A-Za-z]*i|^--in-place", a) for a in args[1:]):
+            targets += [a for a in files if a.endswith(".md")]
     return [resolve(t, cwd) for t in targets]
 
 
 def check_bash(host: str, command: str, cwd: str) -> None:
-    """Quick refusal for commands that visibly write to an instruction file. Anything it misses is
-    caught after the command runs, by comparing the files (see check_bash_result)."""
+    """After a command that visibly wrote to instruction files: ask the agent to review what it wrote."""
     targets = [p for words, folder, line in simple_commands(command, cwd) for p in write_targets(words, folder, line)]
-    for p in targets:
-        if is_reference(p):
-            emit_deny(MESSAGES[language(read(p) + command)]["bash"].format(path=p, tool=EDIT_TOOL[host]))
+    paths = list(dict.fromkeys(str(p) for p in targets if is_reference(p)))
+    if not paths:
+        return
+    note = MESSAGES[language(command)]["bash"].format(paths=", ".join(paths), tool=EDIT_TOOL[host])
+    emit({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": note}})
+
+
+# --- First edit in a session: show the rules ------------------------------------------------------
+
+def session_folder(data: dict) -> Path:
+    """Where this session records the files already shown to the agent. Old sessions are dropped."""
+    key = data.get("session_id") or data.get("transcript_path") or data.get("cwd") or "session"
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", key):
+        key = hashlib.sha256(key.encode()).hexdigest()[:32]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for old in STATE_DIR.iterdir():
+        try:
+            if old.is_file():
+                old.unlink()  # a command snapshot left by version 0.1
+            elif old.stat().st_mtime < time.time() - STATE_TTL:
+                for f in old.iterdir():
+                    f.unlink()
+                old.rmdir()
+        except OSError:
+            continue
+    folder = STATE_DIR / key
+    folder.mkdir(exist_ok=True)
+    return folder
+
+
+def shown(folder: Path, path: Path) -> bool:
+    """Whether the rules for `path` were already shown in this session; records that they now are.
+    One marker file per path, so hooks for edits made in parallel do not overwrite each other."""
+    marker = folder / hashlib.sha256(str(path).encode()).hexdigest()[:32]
+    if marker.exists():
+        return True
+    marker.touch()
+    os.utime(folder)
+    return False
+
+
+def gate_message(path: Path, after: str, hunks: list[list[str]], said: list[str]) -> str:
+    lines = added_lines(hunks)
+    msg = MESSAGES[language(after + "\n".join(lines))]
+    quoted = "\n".join(f"+ {l}" for l in lines[:SHOWN_LINES])
+    if len(lines) > SHOWN_LINES:
+        quoted += "\n" + msg["more"].format(n=len(lines) - SHOWN_LINES)
+    text = msg["gate"].format(name=path.name, lines=quoted)
+    dates = pattern_problems([(l, s) for l, s in new_words(hunks) if not dictated(l, said)], DATE_PATTERNS)
+    if dates:
+        text += "\n\n" + msg["dates"].format(dates="\n".join(dates))
+    return text
 
 
 def review(host: str, path: Path, before: str, after: str, said: list[str] = ()) -> str | None:
-    """Reason to refuse an edit that turns `path` from `before` into `after`, or None if it may stay.
-    `said` holds the user's latest messages."""
+    """The judge's reason to refuse an edit that turns `path` from `before` into `after`, or None if
+    it may stay. `said` holds the user's latest messages."""
     if not is_reference(path):
         return None
     hunks = diff_hunks(before, after)
@@ -670,11 +730,9 @@ def review(host: str, path: Path, before: str, after: str, said: list[str] = ())
     msg = MESSAGES[lang]
     header = msg["header"].format(name=path.name)
     added = [(line, spans) for line, spans in new_words(hunks) if not dictated(line, said)]
-    found = pattern_problems(added, DATE_PATTERNS if JUDGE_ON else PATTERNS)
+    found = pattern_problems(added, DATE_PATTERNS)
     if found:
         return header + "\n".join(found)
-    if not JUDGE_ON:
-        return None
     problems = judge(host, path, after, hunks, lang, list(said))
     if problems is None:
         if STRICT:
@@ -687,126 +745,24 @@ def review(host: str, path: Path, before: str, after: str, said: list[str] = ())
     return header + "\n".join(problems) if problems else None
 
 
-def check_file(host: str, path: Path, before: str, after: str, said: list[str]) -> None:
-    reason = review(host, path, before, after, said)
-    if reason:
-        emit_deny(reason)
-
-
-# --- Bash: compare instruction files before and after the command -------------------------------
-
-SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "repos", "cache", "plugins",
-             "projects", "dist", "build", ".next", "site-packages"}
-MAX_FILE_BYTES = 300_000
-MAX_FILES = 400
-
-
-def guides_below(root: Path, depth: int = 4) -> list[Path]:
-    found = []
-    base = len(root.parts)
-    for folder, dirs, files in os.walk(root):
-        here = Path(folder)
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and len(here.parts) - base < depth]
-        found += [here / f for f in files if f in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")]
-    return found
-
-
-def named_docs(guide: Path) -> list[Path]:
-    """Markdown files a guide names by path."""
-    text = read(guide)
-    out = []
-    for token in set(MD_TOKEN.findall(text)):
-        p = (guide.parent / token).resolve() if not token.startswith(("/", "~")) else resolve(token, "/")
-        if p.is_file():
-            out.append(p)
-    return out
-
-
-def watched_files(cwd: str, command: str) -> set[Path]:
-    """Instruction files a shell command in `cwd` could plausibly change."""
-    commands = simple_commands(command, cwd)
-    guides = []
-    for start in {Path(cwd).resolve(), *(Path(folder) for _, folder, _ in commands)}:
-        guides += guides_below(start)
-        for folder in [start, *start.parents]:
-            guides += [folder / n for n in ("AGENTS.md", "CLAUDE.md", "GEMINI.md") if (folder / n).is_file()]
-            if folder == HOME:
-                break
-    for home in AGENT_HOMES:
-        guides += [p for p in (home / "CLAUDE.md", home / "AGENTS.md") if p.is_file()]
-        for sub in ("context", "skills", "rules", "agents", "commands"):
-            if (home / sub).is_dir():
-                guides += list(guides_below(home / sub, depth=3))
-                guides += [p for p in (home / sub).rglob("*.md") if p.is_file()][:MAX_FILES]
-    files = set()
-    for g in guides:
-        files.add(g.resolve())
-        files.update(named_docs(g))
-    files.update(resolve(t, folder) for _, folder, line in commands for t in MD_TOKEN.findall(line))
-    return {p for p in list(files)[: MAX_FILES * 2] if is_reference(p)}
-
-
-def snapshot_path(data: dict) -> Path:
-    key = data.get("tool_use_id") or str(abs(hash(json.dumps(data.get("tool_input", {}), sort_keys=True))))
-    folder = Path(tempfile.gettempdir()) / "agent-doc-guard"
-    folder.mkdir(exist_ok=True)
-    return folder / f"{data.get('session_id', 'session')}-{re.sub(r'[^A-Za-z0-9_-]', '', key)}.json"
-
-
-def take_snapshot(data: dict, cwd: str, command: str) -> None:
-    # snapshots of commands that never reached PostToolUse (refused, failed) are dropped after an hour
-    for old in snapshot_path(data).parent.glob("*.json"):
-        try:
-            if old.stat().st_mtime < time.time() - 3600:
-                old.unlink()
-        except OSError:
-            continue
-    files = {}
-    for p in watched_files(cwd, command):
-        try:
-            if p.stat().st_size <= MAX_FILE_BYTES:
-                files[str(p)] = p.read_text(errors="ignore")
-        except OSError:
-            continue
-    snapshot_path(data).write_text(json.dumps({"cwd": cwd, "command": command, "files": files}))
-
-
-def check_bash_result(host: str, data: dict) -> None:
-    """After a shell command: any instruction file it changed gets the same review as an edit.
-    A refused change is put back and the agent is told why."""
-    snap = snapshot_path(data)
-    if not snap.is_file():
+def check_edit(host: str, data: dict, changes: list[Change]) -> None:
+    """Refuse the first edit that adds lines to an instruction file in this session, showing the rules
+    and the added lines. Later edits go through, or to the judge when it is on."""
+    said = user_messages(data.get("transcript_path"))
+    changes = [(p, b, a) for p, b, a in changes if is_reference(p) and added_lines(diff_hunks(b, a))]
+    if not changes:
         return
-    saved = json.loads(snap.read_text())
-    snap.unlink()
-    before = saved["files"]
-    paths = set(before) | {str(p) for p in watched_files(saved["cwd"], saved["command"])}
-    reasons = []
-    for name in sorted(paths):
-        p = Path(name)
-        old = before.get(name, "")
-        new = read(p)
-        if new == old or not p.exists():
-            continue  # unchanged, or deleted
-        reason = review(host, p, old, new, user_messages(data.get("transcript_path")))
+    folder = session_folder(data)
+    # a patch may touch several files; every file not yet shown is shown in the same refusal
+    first = [(p, b, a) for p, b, a in changes if not shown(folder, p)]
+    if first:
+        emit_deny("\n\n---\n\n".join(gate_message(p, a, diff_hunks(b, a), said) for p, b, a in first))
+    if not JUDGE_ON:
+        return
+    for path, before, after in changes:
+        reason = review(host, path, before, after, said)
         if reason:
-            if p.is_symlink():
-                # saved paths are resolved, so a link here was made by the command; writing through
-                # it would overwrite the file it points to
-                p.unlink()
-            if name in before:
-                p.write_text(old)
-            elif p.exists():
-                p.unlink()
-            reasons.append(reason)
-    if reasons:
-        lang = language("\n".join(reasons))
-        note = MESSAGES[lang]["reverted"].format(tool=EDIT_TOOL[host])
-        emit({
-            "decision": "block",
-            "reason": note + "\n\n" + "\n\n".join(reasons),
-            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": note},
-        })
+            emit_deny(reason)
 
 
 def main() -> None:
@@ -820,20 +776,15 @@ def main() -> None:
     host = "codex" if codex else "claude"
     event = data.get("hook_event_name", "PreToolUse")
 
-    if tool == "Bash" and event == "PostToolUse":
-        check_bash_result(host, data)
-    elif tool == "Bash":
-        command = inp.get("command", "")
-        check_bash(host, command, cwd)
-        take_snapshot(data, cwd, command)
+    if tool == "Bash":
+        if event == "PostToolUse":
+            check_bash(host, inp.get("command", ""), cwd)
     elif event != "PreToolUse":
         return
     elif tool == "apply_patch":
-        for path, before, after in codex_changes(inp.get("command", ""), cwd):
-            check_file(host, path, before, after, user_messages(data.get("transcript_path")))
+        check_edit(host, data, codex_changes(inp.get("command", ""), cwd))
     elif tool in ("Edit", "Write", "MultiEdit"):
-        for path, before, after in claude_changes(tool, inp, cwd):
-            check_file(host, path, before, after, user_messages(data.get("transcript_path")))
+        check_edit(host, data, claude_changes(tool, inp, cwd))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 {
-  "description": "Check edits to agent instruction files before they are written",
+  "description": "Show the rules for agent instruction files before an agent adds to them",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|Bash|apply_patch",
+        "matcher": "Edit|Write|MultiEdit|apply_patch",
         "hooks": [
           {
             "type": "command",
@@ -21,7 +21,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/agent_doc_guard.py\"",
-            "timeout": 300,
+            "timeout": 30,
             "statusMessage": "Checking instruction files after command"
           }
         ]
