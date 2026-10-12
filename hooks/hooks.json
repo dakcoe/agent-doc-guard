@@ -1,5 +1,5 @@
 {
-  "description": "Show the rules for agent instruction files before an agent adds to them",
+  "description": "Show agents the rules for instruction files and review what they add",
   "hooks": {
     "PreToolUse": [
       {
@@ -8,21 +8,20 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/agent_doc_guard.py\"",
-            "timeout": 300,
-            "statusMessage": "Checking instruction file edit"
+            "timeout": 30
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Edit|Write|MultiEdit|apply_patch|Bash",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/agent_doc_guard.py\"",
-            "timeout": 30,
-            "statusMessage": "Checking instruction files after command"
+            "timeout": 300,
+            "statusMessage": "Reviewing instruction file changes"
           }
         ]
       }

@@ -45,7 +45,7 @@ For each **rewrite** file:
 
 Rewrite the first file, show it to the user with a short list of what was dropped, and wait for their go-ahead before the rest. Their correction calibrates the remaining files.
 
-Done for a file when the guard accepts the write and every fact from the backup copy is either still present or listed as deliberately dropped.
+Done for a file when the guard's notes on it are addressed and every fact from the backup copy is either still present or listed as deliberately dropped.
 
 ## 4. Report
 

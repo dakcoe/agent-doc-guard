@@ -1,8 +1,9 @@
 """Run: python3 -m unittest discover tests
-GuardTest runs the hook with the judge model switched off: file detection, the first-edit refusal and the Bash note.
+GuardTest runs the hook with the judge model switched off: file detection, the notes after an edit and the Bash note.
 JudgeTest replaces the judge model with a fake: what the judge is sent, and which of its answers count."""
 
 import importlib.util
+import itertools
 import json
 import os
 import subprocess
@@ -12,6 +13,7 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "agent_doc_guard.py"
+CALLS = itertools.count()
 
 
 def hook_env(state: Path) -> dict:
@@ -26,12 +28,8 @@ def run(payload: dict, state: Path) -> dict:
     return json.loads(out) if out else {}
 
 
-def denied(result: dict) -> bool:
-    return result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
-
-
-def reason(result: dict) -> str:
-    return result["hookSpecificOutput"]["permissionDecisionReason"]
+def note(result: dict) -> str:
+    return result.get("hookSpecificOutput", {}).get("additionalContext", "")
 
 
 class GuardTest(unittest.TestCase):
@@ -52,36 +50,48 @@ class GuardTest(unittest.TestCase):
     def hook(self, payload: dict) -> dict:
         return run({"cwd": str(self.root), "session_id": self.session, **payload}, self.state)
 
-    def edit(self, rel: str, new: str, old: str = "x") -> dict:
-        """Edit `rel`, replacing `old`. A file that does not exist yet starts as the line "x"."""
+    def call(self, tool: str, tool_input: dict, apply, transcript: str = "") -> dict:
+        """Run the hook before the tool, `apply` the change, run it after; the result after the tool.
+        The hook must never refuse the call."""
+        payload = {"tool_name": tool, "tool_input": tool_input, "tool_use_id": f"t{next(CALLS)}",
+                   "transcript_path": transcript}
+        self.assertEqual(self.hook({**payload, "hook_event_name": "PreToolUse"}), {})
+        apply()
+        return self.hook({**payload, "hook_event_name": "PostToolUse"})
+
+    def edit(self, rel: str, new: str, old: str = "x", transcript: str = "") -> str:
+        """Edit `rel`, replacing `old`; the note given after it. A file that does not exist yet starts as the line "x"."""
         path = self.root / rel
         if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("x\n")
-        return self.hook({"tool_name": "Edit", "tool_input": {"file_path": str(path), "old_string": old, "new_string": new}})
 
-    def gated(self, rel: str, new: str = "- Keep transitions moving.") -> bool:
-        """Whether the first edit adding `new` to `rel` in a fresh session is refused."""
-        self.session = f"s{abs(hash((rel, new)))}"
-        return denied(self.edit(rel, new))
+        def apply():
+            path.write_text(path.read_text().replace(old, new, 1))
+        return note(self.call("Edit", {"file_path": str(path), "old_string": old, "new_string": new}, apply, transcript))
+
+    def noted(self, rel: str, new: str = "- Keep transitions moving.") -> bool:
+        """Whether the first edit adding `new` to `rel` in a fresh session gets a note."""
+        self.session = f"s{next(CALLS)}"
+        return bool(self.edit(rel, new))
 
     # which files count as instruction files
     def test_agents_md_and_linked_doc_are_checked(self):
-        self.assertTrue(self.gated("AGENTS.md"))
-        self.assertTrue(self.gated("docs/style.md"))
+        self.assertTrue(self.noted("AGENTS.md"))
+        self.assertTrue(self.noted("docs/style.md"))
 
     def test_bare_name_only_matches_next_to_the_guide(self):
         (self.root / "AGENTS.md").write_text("Put links in upload.md when publishing.\n")
-        (self.root / "videos" / "a").mkdir(parents=True)
-        self.assertTrue(self.gated("upload.md"))
-        self.assertFalse(self.gated("videos/a/upload.md"))
+        self.assertTrue(self.noted("upload.md"))
+        self.assertFalse(self.noted("videos/a/upload.md"))
 
     def test_changelog_is_ignored(self):
         (self.root / "AGENTS.md").write_text("Record changes in CHANGELOG.md.\n")
-        self.assertFalse(self.gated("CHANGELOG.md", "## 2026-10-05\n- Added Codex support."))
+        self.assertFalse(self.noted("CHANGELOG.md", "## 2026-10-05\n- Added Codex support."))
 
     def test_unlinked_markdown_and_other_files_are_ignored(self):
-        self.assertFalse(self.gated("notes.md"))
-        self.assertFalse(self.gated("app.py", "# 2026-10-05"))
+        self.assertFalse(self.noted("notes.md", "Fixed on 2026-10-05."))
+        self.assertFalse(self.noted("app.py", "# 2026-10-05"))
 
     def test_backup_copy_of_agent_folder_is_not_an_instruction_file(self):
         guard = load_guard()
@@ -91,85 +101,98 @@ class GuardTest(unittest.TestCase):
         self.assertTrue(guard.is_reference(self.root / ".claude" / "x.md"))
         self.assertTrue(guard.is_reference(Path.home() / ".agents" / "skills" / "x" / "reference.md"))
 
-    # the first edit in a session
-    def test_first_edit_is_refused_once_per_file_and_session(self):
-        self.assertTrue(denied(self.edit("AGENTS.md", "- Keep transitions moving.")))
-        self.assertFalse(denied(self.edit("AGENTS.md", "- Keep transitions moving.")))
-        self.assertTrue(denied(self.edit("docs/style.md", "- Keep captions short.")))
+    # notes after an edit
+    def test_rules_are_shown_once_per_file_and_session(self):
+        first = self.edit("AGENTS.md", "- Keep transitions moving.")
+        self.assertIn("instruction file", first)
+        self.assertIn("+ - Keep transitions moving.", first)
+        self.assertIn("unrelated", first)
+        self.assertIn("CHANGELOG.md", first)
+        self.assertEqual(self.edit("AGENTS.md", "- Run tests first.", old="- Keep transitions moving."), "")
+        self.assertIn("instruction file", self.edit("docs/style.md", "- Keep captions short."))
         self.session = "s2"
-        self.assertTrue(denied(self.edit("AGENTS.md", "- Keep transitions moving.")))
+        self.assertIn("instruction file", self.edit("AGENTS.md", "- Keep it short.", old="- Run tests first."))
 
-    def test_refusal_states_the_rules_and_quotes_the_added_lines(self):
-        text = reason(self.edit("AGENTS.md", "- Keep transitions moving.\n- Fixed on 2026-10-05."))
-        self.assertIn("instruction file", text)
-        self.assertIn("+ - Keep transitions moving.", text)
-        self.assertIn('[date] "2026-10-05"', text)
-        self.assertNotIn("[date]", reason(self.edit("docs/style.md", "- Keep captions short.")))
+    def test_lines_to_fix_are_named_on_every_edit(self):
+        self.edit("AGENTS.md", "- Keep transitions moving.")
+        later = self.edit("AGENTS.md", "- Fixed on 2026-10-05.", old="- Keep transitions moving.")
+        self.assertIn('[date] "2026-10-05"', later)
+        self.assertNotIn("+ - Fixed", later)  # the rules and the line list are not repeated
+        self.assertIn('[past incident] "넣었다가"', self.edit("docs/style.md", "- 넣었다가 다시 뺐다."))
 
     def test_message_follows_file_language(self):
-        self.assertIn("지침 문서", reason(self.edit("docs/style.md", "- 10월 3일에 겹쳤다.")))
-        self.assertIn("instruction file", reason(self.edit("AGENTS.md", "- Fixed on 2026-10-05.")))
+        self.assertIn("지침 문서", self.edit("docs/style.md", "- 10월 3일에 겹쳤다."))
+        self.assertIn("instruction file", self.edit("AGENTS.md", "- Fixed on 2026-10-05."))
 
-    def test_retry_with_a_date_goes_through(self):
-        self.edit("AGENTS.md", "- Fixed on 2026-10-05.")
-        self.assertFalse(denied(self.edit("AGENTS.md", "- Fixed on 2026-10-05.")))
+    def test_line_the_user_wrote_out_is_not_flagged(self):
+        transcript = self.root.parent / "session.jsonl"
+        line = "- 10월 5일 이후 만든 영상은 자막을 두 줄로 쓴다."
+        transcript.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": f"'{line}' 줄을 넣어 줘."}},
+                                         ensure_ascii=False) + "\n")
+        self.assertNotIn("[date]", self.edit("AGENTS.md", line, transcript=str(transcript)))
 
-    def test_removing_lines_is_never_stopped(self):
+    def test_removing_lines_gets_no_note(self):
         (self.root / "docs" / "style.md").write_text("# Style\nFixed on 2026-10-05.\n")
-        self.assertFalse(denied(self.edit("docs/style.md", "", old="Fixed on 2026-10-05.")))
-        # and does not use up the first-edit refusal
-        self.assertTrue(denied(self.edit("docs/style.md", "- Keep captions short.", old="# Style")))
+        self.assertEqual(self.edit("docs/style.md", "", old="Fixed on 2026-10-05.\n"), "")
+        # and does not use up the first note
+        self.assertIn("instruction file", self.edit("docs/style.md", "# Style\n- Keep captions short.", old="# Style"))
 
-    def test_new_file_written_whole_is_refused_once(self):
-        payload = {"tool_name": "Write", "tool_input": {"file_path": str(self.root / "sub" / "CLAUDE.md"),
-                                                         "content": "# Rules\n- Keep it short.\n"}}
-        self.assertTrue(denied(self.hook(payload)))
-        self.assertFalse(denied(self.hook(payload)))
+    def test_new_file_written_whole(self):
+        path = self.root / "sub" / "CLAUDE.md"
 
-    def test_parallel_edits_each_get_their_own_record(self):
-        payloads = [{"cwd": str(self.root), "session_id": "p", "tool_name": "Edit",
-                     "tool_input": {"file_path": str(self.root / rel), "old_string": "x", "new_string": "- Rule."}}
-                    for rel in ("AGENTS.md", "docs/style.md")]
-        procs = [subprocess.Popen([sys.executable, str(SCRIPT)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  text=True, env=hook_env(self.state)) for _ in payloads]
-        for proc, payload in zip(procs, payloads):
-            proc.stdin.write(json.dumps(payload))
-            proc.stdin.close()
-        results = [json.loads(proc.stdout.read()) for proc in procs]
-        for proc in procs:
-            proc.wait()
-            proc.stdout.close()
-        self.assertTrue(all(denied(r) for r in results))
-        self.session = "p"
-        self.assertFalse(denied(self.edit("AGENTS.md", "- Rule.")))
-        self.assertFalse(denied(self.edit("docs/style.md", "- Rule.")))
+        def apply():
+            path.parent.mkdir()
+            path.write_text("# Rules\n- Keep it short.\n")
+        text = note(self.call("Write", {"file_path": str(path), "content": "# Rules\n- Keep it short.\n"}, apply))
+        self.assertIn("+ - Keep it short.", text)
+
+    def test_edit_that_did_not_run_gets_no_note(self):
+        self.assertEqual(note(self.call("Edit", {"file_path": str(self.root / "AGENTS.md"), "old_string": "x",
+                                                 "new_string": "- Rule."}, lambda: None)), "")
+
+    def test_edits_in_parallel_are_kept_apart(self):
+        paths = [self.root / "AGENTS.md", self.root / "docs" / "style.md"]
+        payloads = [{"tool_name": "Edit", "tool_use_id": f"p{i}",
+                     "tool_input": {"file_path": str(p), "old_string": "x", "new_string": f"- Rule {i}."}}
+                    for i, p in enumerate(paths)]
+        for payload in payloads:
+            self.hook({**payload, "hook_event_name": "PreToolUse"})
+        for i, p in enumerate(paths):
+            p.write_text(p.read_text().replace("x", f"- Rule {i}.", 1))
+        notes = [note(self.hook({**payload, "hook_event_name": "PostToolUse"})) for payload in payloads]
+        self.assertIn("+ - Rule 0.", notes[0])
+        self.assertIn("+ - Rule 1.", notes[1])
+        self.assertNotIn("Rule 1", notes[0])
 
     # Codex
-    def patch(self, body: str) -> dict:
-        return self.hook({"tool_name": "apply_patch", "transcript_path": "/home/u/.codex/sessions/x.jsonl",
-                          "tool_input": {"command": "*** Begin Patch\n" + body + "\n*** End Patch"}})
-
-    def test_codex_patch_is_refused_once_for_all_files_in_it(self):
+    def test_codex_patch_notes_every_file_in_it(self):
         body = "*** Update File: docs/style.md\n@@\n-x\n+Keep captions short.\n*** Add File: other/AGENTS.md\n+- Rule."
-        text = reason(self.patch(body))
-        self.assertIn("style.md", text)
-        self.assertIn("AGENTS.md", text)
-        self.assertFalse(denied(self.patch(body)))
+        command = "*** Begin Patch\n" + body + "\n*** End Patch"
 
-    def test_codex_patch_on_other_files_and_deletions_pass(self):
-        self.assertFalse(denied(self.patch("*** Update File: notes.md\n@@\n+Fixed on 2026-10-05.")))
-        self.assertFalse(denied(self.patch("*** Delete File: docs/style.md")))
+        def apply():
+            style = self.root / "docs" / "style.md"
+            style.write_text(style.read_text().replace("x", "Keep captions short."))
+            (self.root / "other").mkdir()
+            (self.root / "other" / "AGENTS.md").write_text("- Rule.\n")
+        text = note(self.call("apply_patch", {"command": command}, apply, "/home/u/.codex/sessions/x.jsonl"))
+        self.assertIn("style.md", text)
+        self.assertIn("+ - Rule.", text)
+        self.assertIn("apply_patch", text)
+
+    def test_codex_patch_on_other_files_and_deletions_get_no_note(self):
+        for body in ["*** Update File: notes.md\n@@\n+Fixed on 2026-10-05.", "*** Delete File: docs/style.md"]:
+            command = "*** Begin Patch\n" + body + "\n*** End Patch"
+            self.assertEqual(note(self.call("apply_patch", {"command": command}, lambda: None)), "", body)
 
     # Bash
     def bash(self, command: str, transcript: str = "") -> str:
         """The note added after `command` ran, or "" if none."""
         r = self.hook({"tool_name": "Bash", "hook_event_name": "PostToolUse", "transcript_path": transcript,
                        "tool_input": {"command": command}})
-        self.assertFalse(denied(r))
         self.assertNotIn("decision", r)
-        return r.get("hookSpecificOutput", {}).get("additionalContext", "")
+        return note(r)
 
-    def test_bash_is_never_refused_before_it_runs(self):
+    def test_bash_is_never_checked_before_it_runs(self):
         r = self.hook({"tool_name": "Bash", "hook_event_name": "PreToolUse", "tool_input": {"command": "echo hi >> AGENTS.md"}})
         self.assertEqual(r, {})
 
@@ -232,30 +255,30 @@ class JudgeTest(unittest.TestCase):
         path.write_text(text)
         return path
 
-    def review(self, tool: str, inp: dict):
+    def problems(self, tool: str, inp: dict, said: list[str] = ()) -> str:
         [(path, before, after)] = self.guard.claude_changes(tool, inp, str(self.root))
-        return self.guard.review("claude", path, before, after)
+        return "\n".join(self.guard.problems("claude", path, before, after, list(said)))
 
     @staticmethod
     def section(message: str, name: str) -> str:
         return message.split(f"[{name}]\n", 1)[1].split("\n\n[", 1)[0]
 
-    def test_with_the_judge_only_dates_are_refused_by_pattern(self):
+    def test_with_the_judge_word_patterns_are_left_to_it(self):
         path = self.write("# Rules\nx\n")
-        self.assertIsNone(self.review("Edit", {"file_path": str(path), "old_string": "x",
-                                               "new_string": "- 지적한 부분만 고친다."}))
+        self.assertEqual(self.problems("Edit", {"file_path": str(path), "old_string": "x",
+                                                "new_string": "- 지적한 부분만 고친다."}), "")
         self.assertEqual(len(self.messages), 1)
-        self.assertIn("2026-10-05", self.review("Edit", {"file_path": str(path), "old_string": "x",
-                                                         "new_string": "- Fixed on 2026-10-05."}))
-        self.assertEqual(len(self.messages), 1)
+        self.assertIn("2026-10-05", self.problems("Edit", {"file_path": str(path), "old_string": "x",
+                                                          "new_string": "- Fixed on 2026-10-05."}))
 
     def test_word_patterns_apply_when_the_judge_fails(self):
         def broken(message, env):
             raise RuntimeError
         self.guard.ask_claude = broken
         path = self.write("# Rules\nx\n")
-        self.assertIn("넣었다가", self.review("Edit", {"file_path": str(path), "old_string": "x",
-                                                    "new_string": "- 넣었다가 다시 뺐다."}))
+        self.assertIn("넣었다가", self.problems("Edit", {"file_path": str(path), "old_string": "x",
+                                                     "new_string": "- 넣었다가 다시 뺐다."}))
+        self.assertEqual(len(self.guard.NOTICES), 1)
 
     def transcript(self, *rows: dict) -> list[str]:
         path = self.root / "session.jsonl"
@@ -281,50 +304,45 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(said, ["여백은 넉넉히 두라고 적어 줘."])
         self.assertEqual(self.guard.user_messages(str(self.root / "missing.jsonl")), [])
 
-    def test_line_the_user_wrote_out_is_never_refused(self):
+    def test_line_the_user_wrote_out_is_never_flagged(self):
         path = self.write("# Rules\nx\n")
         line = "- 10월 5일 이후 만든 영상은 자막을 두 줄로 쓴다."
-        said = [f"AGENTS.md에 '{line}' 줄을 넣어 줘."]
         edit = ("Edit", {"file_path": str(path), "old_string": "x", "new_string": line})
-        self.assertIsNotNone(self.review(*edit))
+        self.assertNotEqual(self.problems(*edit), "")
         self.answer = {"ok": False, "problems": [{"line": line, "kind": "provenance", "fix": "drop the date"}]}
-        [(p, before, after)] = self.guard.claude_changes(*edit, str(self.root))
-        self.assertIsNone(self.guard.review("claude", p, before, after, said))
+        self.assertEqual(self.problems(*edit, said=[f"AGENTS.md에 '{line}' 줄을 넣어 줘."]), "")
 
     def test_judge_sees_the_user_messages(self):
         path = self.write("# Rules\nx\n")
-        [(p, before, after)] = self.guard.claude_changes(
-            "Edit", {"file_path": str(path), "old_string": "x", "new_string": "- Keep the Venn diagram example."},
-            str(self.root))
-        self.guard.review("claude", p, before, after, ["Keep the example as it is."])
+        self.problems("Edit", {"file_path": str(path), "old_string": "x", "new_string": "- Keep the Venn diagram example."},
+                      said=["Keep the example as it is."])
         self.assertEqual(self.section(self.messages[0] + "\n\n[", "USER MESSAGES"), "---\nKeep the example as it is.")
 
     def test_partial_edit_shows_whole_old_and_new_line(self):
         path = self.write("# Rules\n- Keep captions to two lines.\n- Run tests before committing.\n")
-        self.review("Edit", {"file_path": str(path), "old_string": "two", "new_string": "three"})
+        self.problems("Edit", {"file_path": str(path), "old_string": "two", "new_string": "three"})
         diff = self.section(self.messages[0], "DIFF")
         self.assertIn("\n-- Keep captions to two lines.\n", diff)
         self.assertIn("\n+- Keep captions to three lines.\n", diff)
-        self.assertNotIn("[NEW]", self.messages[0])
 
     def test_problem_on_untouched_line_is_dropped(self):
         path = self.write("# Rules\n- Keep captions to two lines.\n- Run tests before committing.\n")
         edit = {"file_path": str(path), "old_string": "two", "new_string": "three"}
         self.answer = {"ok": False, "problems": [
             {"line": "- Run tests before committing.", "kind": "unnecessary", "fix": "drop it"}]}
-        self.assertIsNone(self.review("Edit", edit))
-        # the same kind of answer about the changed line still refuses the edit
+        self.assertEqual(self.problems("Edit", edit), "")
+        # the same kind of answer about the changed line counts
         self.answer = {"ok": False, "problems": [
             {"line": "+-  Keep captions to three", "kind": "unnecessary", "fix": "drop it"}]}
-        self.assertIn("Keep captions to three", self.review("Edit", edit))
+        self.assertIn("Keep captions to three", self.problems("Edit", edit))
         # a quote without the list bullet still points at the changed line
         self.answer = {"ok": False, "problems": [
             {"line": "Keep captions to three lines", "kind": "unnecessary", "fix": "drop it"}]}
-        self.assertIsNotNone(self.review("Edit", edit))
+        self.assertNotEqual(self.problems("Edit", edit), "")
 
     def test_section_removed_in_same_edit_is_only_a_minus_line(self):
         path = self.write("# Rules\n## A\n- Run the tests before every commit.\n\n## B\n- Keep captions short.\n")
-        self.review("MultiEdit", {"file_path": str(path), "edits": [
+        self.problems("MultiEdit", {"file_path": str(path), "edits": [
             {"old_string": "## A\n- Run the tests before every commit.\n\n", "new_string": ""},
             {"old_string": "- Keep captions short.\n", "new_string": "- Keep captions short.\n- Run tests before each commit.\n"},
         ]})
@@ -350,7 +368,7 @@ class JudgeTest(unittest.TestCase):
         edited = list(rows)
         for i in (5, 30, 55):
             edited[i] = f"- Rule number {i} is reworded."
-        self.review("Write", {"file_path": str(path), "content": "\n".join(edited) + "\n"})
+        self.problems("Write", {"file_path": str(path), "content": "\n".join(edited) + "\n"})
         self.assertEqual(len(self.messages), 3)
         reworded = sorted(self.section(m, "DIFF").split("\n+")[1].split("\n")[0] for m in self.messages)
         self.assertEqual(reworded, [f"- Rule number {i} is reworded." for i in (30, 5, 55)])
